@@ -1,17 +1,9 @@
 import os
-import time
 import logging
-import schedule
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
 
-from config import (
-    SYMBOLS,
-    SHORT_WINDOW,
-    LONG_WINDOW,
-    TRADE_QUANTITY,
-    CHECK_INTERVAL_SECONDS,
-)
+from config import SYMBOLS, SHORT_WINDOW, LONG_WINDOW, TRADE_QUANTITY
 
 load_dotenv()
 
@@ -91,15 +83,7 @@ def run_strategy():
 
 
 if __name__ == "__main__":
-    logger.info("Trading bot started")
     logger.info(f"Symbols  : {', '.join(SYMBOLS)}")
     logger.info(f"Strategy : {SHORT_WINDOW}-day / {LONG_WINDOW}-day MA crossover")
-    logger.info(f"Interval : every {CHECK_INTERVAL_SECONDS}s")
-
     run_strategy()
-
-    schedule.every(CHECK_INTERVAL_SECONDS).seconds.do(run_strategy)
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    logger.info("Run complete")
