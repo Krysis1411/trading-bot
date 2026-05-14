@@ -47,9 +47,10 @@ def calculate_rsi(prices, period=RSI_PERIOD):
 def get_market_data(symbol):
     """Returns (current_price, rsi, ma_200) or (None, None, None) on failure."""
     try:
-        start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
-        hourly_bars = api.get_bars(symbol, "1Hour", start=start, limit=RSI_PERIOD + 20).df
-        daily_bars = api.get_bars(symbol, "1Day", limit=MA_TREND_PERIOD).df
+        hourly_start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+        daily_start = (datetime.utcnow() - timedelta(days=300)).strftime("%Y-%m-%d")
+        hourly_bars = api.get_bars(symbol, "1Hour", start=hourly_start, limit=RSI_PERIOD + 20).df
+        daily_bars = api.get_bars(symbol, "1Day", start=daily_start, limit=MA_TREND_PERIOD).df
 
         if len(hourly_bars) < RSI_PERIOD:
             logger.warning(f"{symbol}: not enough hourly bars ({len(hourly_bars)})")
