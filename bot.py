@@ -1,5 +1,6 @@
 import os
 import logging
+from datetime import datetime, timedelta
 import pandas as pd
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
@@ -42,7 +43,8 @@ def calculate_rsi(prices, period=RSI_PERIOD):
 
 
 def get_rsi(symbol):
-    bars = api.get_bars(symbol, "1Hour", limit=RSI_PERIOD + 10).df
+    start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    bars = api.get_bars(symbol, "1Hour", start=start, limit=RSI_PERIOD + 20).df
     if len(bars) < RSI_PERIOD:
         logger.warning(f"{symbol}: not enough bar data ({len(bars)} bars)")
         return None
