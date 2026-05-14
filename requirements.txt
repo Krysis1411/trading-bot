@@ -1,3 +1,4 @@
+# Live trading dependencies (used by CI / bot.py)
 alpaca-trade-api
 pandas
 python-dotenv
