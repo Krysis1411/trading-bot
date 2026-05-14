@@ -1,9 +1,16 @@
 import os
 import logging
+import pandas as pd
 from dotenv import load_dotenv
 import alpaca_trade_api as tradeapi
 
-from config import SYMBOLS, SHORT_WINDOW, LONG_WINDOW, TRADE_QUANTITY
+from config import (
+    SYMBOLS,
+    RSI_PERIOD,
+    RSI_OVERSOLD,
+    RSI_OVERBOUGHT,
+    TRADE_QUANTITY,
+)
 
 load_dotenv()
 
@@ -24,13 +31,23 @@ def is_market_open():
     return api.get_clock().is_open
 
 
-def get_moving_averages(symbol):
-    bars = api.get_bars(symbol, "1Day", limit=LONG_WINDOW + 1).df
-    if len(bars) < LONG_WINDOW:
+def calculate_rsi(prices, period=RSI_PERIOD):
+    delta = prices.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def get_rsi(symbol):
+    bars = api.get_bars(symbol, "1Hour", limit=RSI_PERIOD + 10).df
+    if len(bars) < RSI_PERIOD:
         logger.warning(f"{symbol}: not enough bar data ({len(bars)} bars)")
-        return None, None
-    prices = bars["close"]
-    return prices.tail(SHORT_WINDOW).mean(), prices.tail(LONG_WINDOW).mean()
+        return None
+    rsi = calculate_rsi(bars["close"])
+    return round(rsi.iloc[-1], 2)
 
 
 def get_position_qty(symbol):
@@ -45,20 +62,18 @@ def run_strategy():
         logger.info("Market closed — skipping run")
         return
 
-    logger.info("--- Strategy check ---")
+    logger.info("--- RSI Strategy check ---")
 
     for symbol in SYMBOLS:
         try:
-            short_ma, long_ma = get_moving_averages(symbol)
-            if short_ma is None:
+            rsi = get_rsi(symbol)
+            if rsi is None:
                 continue
 
             qty = get_position_qty(symbol)
-            logger.info(
-                f"{symbol} | Short MA: {short_ma:.2f} | Long MA: {long_ma:.2f} | Position: {qty} shares"
-            )
+            logger.info(f"{symbol} | RSI: {rsi} | Position: {qty} shares")
 
-            if short_ma > long_ma and qty == 0:
+            if rsi < RSI_OVERSOLD and qty == 0:
                 api.submit_order(
                     symbol=symbol,
                     qty=TRADE_QUANTITY,
@@ -66,9 +81,9 @@ def run_strategy():
                     type="market",
                     time_in_force="day",
                 )
-                logger.info(f"BUY  {TRADE_QUANTITY} share(s) of {symbol}")
+                logger.info(f"BUY  {TRADE_QUANTITY} share(s) of {symbol} — RSI oversold at {rsi}")
 
-            elif short_ma < long_ma and qty > 0:
+            elif rsi > RSI_OVERBOUGHT and qty > 0:
                 api.submit_order(
                     symbol=symbol,
                     qty=qty,
@@ -76,7 +91,10 @@ def run_strategy():
                     type="market",
                     time_in_force="day",
                 )
-                logger.info(f"SELL {qty} share(s) of {symbol}")
+                logger.info(f"SELL {qty} share(s) of {symbol} — RSI overbought at {rsi}")
+
+            else:
+                logger.info(f"{symbol} | No signal (RSI: {rsi})")
 
         except Exception as e:
             logger.error(f"{symbol}: {e}")
@@ -84,6 +102,6 @@ def run_strategy():
 
 if __name__ == "__main__":
     logger.info(f"Symbols  : {', '.join(SYMBOLS)}")
-    logger.info(f"Strategy : {SHORT_WINDOW}-day / {LONG_WINDOW}-day MA crossover")
+    logger.info(f"Strategy : RSI({RSI_PERIOD}) — Buy < {RSI_OVERSOLD} | Sell > {RSI_OVERBOUGHT}")
     run_strategy()
     logger.info("Run complete")
