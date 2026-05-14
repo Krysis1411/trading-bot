@@ -1,16 +1,17 @@
-name: Trading Bot
+name: ORB Day Trading Bot
 
 on:
   schedule:
-    # Runs every 5 minutes Mon-Fri, 13:30-20:00 UTC (9:30am-4:00pm EDT)
+    # Every 5 minutes Mon-Fri, 13:30-20:30 UTC (9:30am-4:30pm EDT)
+    # Runs slightly past 4pm to catch the forced EOD close at 3:45pm ET
     - cron: '*/5 13-20 * * 1-5'
-  workflow_dispatch: # Allow manual trigger from GitHub UI
+  workflow_dispatch: # Manual trigger from GitHub Actions UI
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  run-bot:
+  run-orb-bot:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,8 +24,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run trading bot
+      - name: Run ORB day trading bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python bot.py
+        run: python orb_bot.py
