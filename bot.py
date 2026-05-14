@@ -10,6 +10,7 @@ from config import (
     RSI_PERIOD,
     RSI_OVERSOLD,
     RSI_OVERBOUGHT,
+    STOP_LOSS_PCT,
     TRADE_QUANTITY,
 )
 
@@ -52,11 +53,11 @@ def get_rsi(symbol):
     return round(rsi.iloc[-1], 2)
 
 
-def get_position_qty(symbol):
+def get_position(symbol):
     try:
-        return int(api.get_position(symbol).qty)
+        return api.get_position(symbol)
     except Exception:
-        return 0
+        return None
 
 
 def run_strategy():
@@ -72,10 +73,38 @@ def run_strategy():
             if rsi is None:
                 continue
 
-            qty = get_position_qty(symbol)
+            position = get_position(symbol)
+            qty = int(position.qty) if position else 0
             logger.info(f"{symbol} | RSI: {rsi} | Position: {qty} shares")
 
-            if rsi < RSI_OVERSOLD and qty == 0:
+            if position:
+                unrealized_pct = float(position.unrealized_plpc) * 100
+                logger.info(f"{symbol} | Unrealized P&L: {unrealized_pct:.2f}%")
+
+                # Stop loss hit
+                if unrealized_pct <= -STOP_LOSS_PCT:
+                    api.submit_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side="sell",
+                        type="market",
+                        time_in_force="day",
+                    )
+                    logger.info(f"STOP LOSS hit — SELL {qty} share(s) of {symbol} at {unrealized_pct:.2f}%")
+                    continue
+
+                # RSI take profit
+                if rsi > RSI_OVERBOUGHT:
+                    api.submit_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side="sell",
+                        type="market",
+                        time_in_force="day",
+                    )
+                    logger.info(f"TAKE PROFIT — SELL {qty} share(s) of {symbol} — RSI overbought at {rsi}")
+
+            elif rsi < RSI_OVERSOLD:
                 api.submit_order(
                     symbol=symbol,
                     qty=TRADE_QUANTITY,
@@ -84,16 +113,6 @@ def run_strategy():
                     time_in_force="day",
                 )
                 logger.info(f"BUY  {TRADE_QUANTITY} share(s) of {symbol} — RSI oversold at {rsi}")
-
-            elif rsi > RSI_OVERBOUGHT and qty > 0:
-                api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side="sell",
-                    type="market",
-                    time_in_force="day",
-                )
-                logger.info(f"SELL {qty} share(s) of {symbol} — RSI overbought at {rsi}")
 
             else:
                 logger.info(f"{symbol} | No signal (RSI: {rsi})")
