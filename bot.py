@@ -10,6 +10,7 @@ from config import (
     RSI_PERIOD,
     RSI_OVERSOLD,
     RSI_OVERBOUGHT,
+    MA_TREND_PERIOD,
     STOP_LOSS_PCT,
     TRADE_QUANTITY,
 )
@@ -43,14 +44,30 @@ def calculate_rsi(prices, period=RSI_PERIOD):
     return 100 - (100 / (1 + rs))
 
 
-def get_rsi(symbol):
-    start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
-    bars = api.get_bars(symbol, "1Hour", start=start, limit=RSI_PERIOD + 20).df
-    if len(bars) < RSI_PERIOD:
-        logger.warning(f"{symbol}: not enough bar data ({len(bars)} bars)")
-        return None
-    rsi = calculate_rsi(bars["close"])
-    return round(rsi.iloc[-1], 2)
+def get_market_data(symbol):
+    """Returns (current_price, rsi, ma_200) or (None, None, None) on failure."""
+    try:
+        start = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+        hourly_bars = api.get_bars(symbol, "1Hour", start=start, limit=RSI_PERIOD + 20).df
+        daily_bars = api.get_bars(symbol, "1Day", limit=MA_TREND_PERIOD).df
+
+        if len(hourly_bars) < RSI_PERIOD:
+            logger.warning(f"{symbol}: not enough hourly bars ({len(hourly_bars)})")
+            return None, None, None
+
+        if len(daily_bars) < MA_TREND_PERIOD:
+            logger.warning(f"{symbol}: not enough daily bars ({len(daily_bars)})")
+            return None, None, None
+
+        rsi = round(calculate_rsi(hourly_bars["close"]).iloc[-1], 2)
+        ma_200 = round(daily_bars["close"].mean(), 2)
+        current_price = round(hourly_bars["close"].iloc[-1], 2)
+
+        return current_price, rsi, ma_200
+
+    except Exception as e:
+        logger.error(f"{symbol}: failed to get market data — {e}")
+        return None, None, None
 
 
 def get_position(symbol):
@@ -65,23 +82,27 @@ def run_strategy():
         logger.info("Market closed — skipping run")
         return
 
-    logger.info("--- RSI Strategy check ---")
+    logger.info("--- Strategy check ---")
 
     for symbol in SYMBOLS:
         try:
-            rsi = get_rsi(symbol)
+            current_price, rsi, ma_200 = get_market_data(symbol)
             if rsi is None:
                 continue
 
+            in_uptrend = current_price > ma_200
             position = get_position(symbol)
             qty = int(position.qty) if position else 0
-            logger.info(f"{symbol} | RSI: {rsi} | Position: {qty} shares")
 
+            logger.info(
+                f"{symbol} | Price: {current_price} | RSI: {rsi} | "
+                f"200MA: {ma_200} | Trend: {'UP' if in_uptrend else 'DOWN'} | Position: {qty} shares"
+            )
+
+            # --- Exit logic ---
             if position:
                 unrealized_pct = float(position.unrealized_plpc) * 100
-                logger.info(f"{symbol} | Unrealized P&L: {unrealized_pct:.2f}%")
 
-                # Stop loss hit
                 if unrealized_pct <= -STOP_LOSS_PCT:
                     api.submit_order(
                         symbol=symbol,
@@ -90,10 +111,9 @@ def run_strategy():
                         type="market",
                         time_in_force="day",
                     )
-                    logger.info(f"STOP LOSS hit — SELL {qty} share(s) of {symbol} at {unrealized_pct:.2f}%")
+                    logger.info(f"STOP LOSS — SELL {qty} {symbol} | P&L: {unrealized_pct:.2f}%")
                     continue
 
-                # RSI take profit
                 if rsi > RSI_OVERBOUGHT:
                     api.submit_order(
                         symbol=symbol,
@@ -102,9 +122,13 @@ def run_strategy():
                         type="market",
                         time_in_force="day",
                     )
-                    logger.info(f"TAKE PROFIT — SELL {qty} share(s) of {symbol} — RSI overbought at {rsi}")
+                    logger.info(f"TAKE PROFIT — SELL {qty} {symbol} | RSI: {rsi}")
+                    continue
 
-            elif rsi < RSI_OVERSOLD:
+                logger.info(f"{symbol} | Holding | P&L: {unrealized_pct:.2f}%")
+
+            # --- Entry logic ---
+            elif rsi < RSI_OVERSOLD and in_uptrend:
                 api.submit_order(
                     symbol=symbol,
                     qty=TRADE_QUANTITY,
@@ -112,10 +136,13 @@ def run_strategy():
                     type="market",
                     time_in_force="day",
                 )
-                logger.info(f"BUY  {TRADE_QUANTITY} share(s) of {symbol} — RSI oversold at {rsi}")
+                logger.info(f"BUY {TRADE_QUANTITY} {symbol} | RSI: {rsi} | Above 200MA: {in_uptrend}")
+
+            elif rsi < RSI_OVERSOLD and not in_uptrend:
+                logger.info(f"{symbol} | RSI oversold but DOWNTREND — skipping entry")
 
             else:
-                logger.info(f"{symbol} | No signal (RSI: {rsi})")
+                logger.info(f"{symbol} | No signal")
 
         except Exception as e:
             logger.error(f"{symbol}: {e}")
@@ -123,6 +150,8 @@ def run_strategy():
 
 if __name__ == "__main__":
     logger.info(f"Symbols  : {', '.join(SYMBOLS)}")
-    logger.info(f"Strategy : RSI({RSI_PERIOD}) — Buy < {RSI_OVERSOLD} | Sell > {RSI_OVERBOUGHT}")
+    logger.info(f"Strategy : RSI({RSI_PERIOD}) + 200-day MA trend filter")
+    logger.info(f"Buy      : RSI < {RSI_OVERSOLD} AND price above 200MA")
+    logger.info(f"Sell     : RSI > {RSI_OVERBOUGHT} OR P&L < -{STOP_LOSS_PCT}%")
     run_strategy()
     logger.info("Run complete")
