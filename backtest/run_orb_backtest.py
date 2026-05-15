@@ -35,7 +35,9 @@ from config import (
     BACKTEST_STARTING_BALANCE,
     ORB_CLOSE_HOUR,
     ORB_CLOSE_MINUTE,
+    ORB_MIN_OR_PCT,
     ORB_PROFIT_MULTIPLIER,
+    ORB_PROFIT_MULTIPLIERS,
     ORB_RANGE_BARS,
     ORB_STOP_BUFFER,
     ORB_TRADE_QUANTITY,
@@ -93,17 +95,19 @@ def run_orb_backtest(symbol: str = "AAPL") -> None:
     engine.add_instrument(instrument)
     engine.add_data(bars)
 
+    profit_multiplier = ORB_PROFIT_MULTIPLIERS.get(symbol, ORB_PROFIT_MULTIPLIER)
     strategy = ORBStrategy(
         config=ORBConfig(
             instrument_id=instrument.id,
             bar_type=bar_type,
             trade_size=Decimal(str(ORB_TRADE_QUANTITY)),
             orb_range_bars=ORB_RANGE_BARS,
-            profit_multiplier=ORB_PROFIT_MULTIPLIER,
+            profit_multiplier=profit_multiplier,
             volume_factor=ORB_VOLUME_FACTOR,
             stop_buffer=ORB_STOP_BUFFER,
             close_hour=ORB_CLOSE_HOUR,
             close_minute=ORB_CLOSE_MINUTE,
+            min_or_pct=ORB_MIN_OR_PCT,
         )
     )
     engine.add_strategy(strategy)

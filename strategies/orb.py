@@ -9,6 +9,12 @@ Stop          : just below OR low (OR low - stop_buffer)
 Target        : OR high + (OR range × profit_multiplier)
 EOD close     : force-close any open position at or after close_hour:close_minute ET
 One trade/day : no re-entry after an exit
+
+Improvements (v2)
+------------------
+1. SPY trend filter   : only enter when SPY latest close > SPY session open
+2. Min OR range filter : skip symbols where OR range / price < min_or_pct
+3. Per-symbol multiplier passed in via config.profit_multiplier (caller looks up the dict)
 """
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
@@ -30,10 +36,14 @@ class ORBConfig(StrategyConfig, frozen=True):
     trade_size: Decimal
     orb_range_bars: PositiveInt = 6
     profit_multiplier: PositiveFloat = 1.5
-    volume_factor: PositiveFloat = 1.2
+    volume_factor: PositiveFloat = 1.0
     stop_buffer: float = 0.05
     close_hour: int = 15
     close_minute: int = 45
+    # Improvement 1: subscribe to SPY bars for trend filter (None = disabled)
+    spy_bar_type: BarType | None = None
+    # Improvement 2: skip if (OR high - OR low) / OR high < this fraction (0 = disabled)
+    min_or_pct: float = 0.005
 
 
 class ORBStrategy(Strategy):
@@ -42,10 +52,9 @@ class ORBStrategy(Strategy):
         self.instrument: Instrument | None = None
         self._reset_daily_state()
         self._current_date: date | None = None
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        self._spy_open: float | None = None
+        self._spy_last: float | None = None
+        self._spy_date: date | None = None
 
     def _reset_daily_state(self) -> None:
         self._or_high: float | None = None
@@ -53,6 +62,7 @@ class ORBStrategy(Strategy):
         self._or_volume_sum: float = 0.0
         self._or_bars_seen: int = 0
         self._range_ready: bool = False
+        self._range_skipped: bool = False
         self._entry_price: float | None = None
         self._stop_price: float | None = None
         self._target_price: float | None = None
@@ -66,10 +76,6 @@ class ORBStrategy(Strategy):
     def _close_time(self) -> time:
         return time(self.config.close_hour, self.config.close_minute)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-
     def on_start(self) -> None:
         self.instrument = self.cache.instrument(self.config.instrument_id)
         if self.instrument is None:
@@ -77,11 +83,24 @@ class ORBStrategy(Strategy):
             self.stop()
             return
         self.subscribe_bars(self.config.bar_type)
+        if self.config.spy_bar_type is not None:
+            self.subscribe_bars(self.config.spy_bar_type)
+
+    def _handle_spy_bar(self, bar: Bar) -> None:
+        bar_date, _ = self._bar_et_time(bar)
+        if self._spy_date != bar_date:
+            self._spy_date = bar_date
+            self._spy_open = bar.open.as_double()
+        self._spy_last = bar.close.as_double()
 
     def on_bar(self, bar: Bar) -> None:
+        # Route SPY bars to their own handler
+        if self.config.spy_bar_type is not None and bar.bar_type == self.config.spy_bar_type:
+            self._handle_spy_bar(bar)
+            return
+
         bar_date, bar_time = self._bar_et_time(bar)
 
-        # New trading day — reset all daily state
         if self._current_date != bar_date:
             self._current_date = bar_date
             self._reset_daily_state()
@@ -102,10 +121,20 @@ class ORBStrategy(Strategy):
                 if self._or_bars_seen >= self.config.orb_range_bars:
                     self._range_ready = True
                     or_range = self._or_high - self._or_low
-                    self.log.info(
-                        f"OR ready | H={self._or_high:.2f}  L={self._or_low:.2f}"
-                        f"  Range={or_range:.2f}"
-                    )
+                    # Improvement 2: filter out narrow / indecisive opens
+                    if self.config.min_or_pct > 0 and or_range / self._or_high < self.config.min_or_pct:
+                        self._range_skipped = True
+                        self.log.debug(
+                            f"OR too narrow ({or_range / self._or_high:.3%} < {self.config.min_or_pct:.3%}) — skipping day"
+                        )
+                    else:
+                        self.log.info(
+                            f"OR ready | H={self._or_high:.2f}  L={self._or_low:.2f}"
+                            f"  Range={or_range:.2f}"
+                        )
+            return
+
+        if self._range_skipped:
             return
 
         # ---- Phase 2: EOD forced close ----
@@ -136,6 +165,13 @@ class ORBStrategy(Strategy):
         if self._traded_today or not self.portfolio.is_flat(self.config.instrument_id):
             return
 
+        # Improvement 1: SPY trend filter — only enter on up-trending days
+        if self.config.spy_bar_type is not None:
+            if self._spy_open is None or self._spy_last is None:
+                return
+            if self._spy_last < self._spy_open:
+                return
+
         avg_or_vol = self._or_volume_sum / max(self._or_bars_seen, 1)
         vol_ok = volume >= avg_or_vol * self.config.volume_factor
 
@@ -159,18 +195,19 @@ class ORBStrategy(Strategy):
                 f"  vol_ratio={volume / avg_or_vol:.2f}x"
             )
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-
     def on_stop(self) -> None:
         self.cancel_all_orders(self.config.instrument_id)
         self.close_all_positions(self.config.instrument_id)
         self.unsubscribe_bars(self.config.bar_type)
+        if self.config.spy_bar_type is not None:
+            self.unsubscribe_bars(self.config.spy_bar_type)
 
     def on_reset(self) -> None:
         self._reset_daily_state()
         self._current_date = None
+        self._spy_open = None
+        self._spy_last = None
+        self._spy_date = None
 
     def on_save(self) -> dict[str, bytes]:
         return {}

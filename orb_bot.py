@@ -9,11 +9,17 @@ Stateless: all state is re-derived from today's Alpaca bars + open positions.
 Strategy
 --------
 Opening range : first 6 × 5-min bars (9:30–10:00 ET)
-Entry         : close breaks above OR high AND bar volume >= avg OR vol × 1.2×
+Entry         : close breaks above OR high AND bar volume >= avg OR vol × factor
 Stop          : OR low - buffer
-Target        : OR high + (OR range × 1.5)
+Target        : OR high + (OR range × per-symbol multiplier)
 EOD close     : force-close any position at 3:45 PM ET
 One trade/day : skip entry if we already have a filled order for this symbol today
+
+Improvements (v2)
+------------------
+1. SPY trend filter   : only enter when SPY latest bar close > SPY session open
+2. Min OR range filter : skip if OR range / OR high < ORB_MIN_OR_PCT (indecisive open)
+3. Per-symbol multiplier : ORB_PROFIT_MULTIPLIERS dict, fallback to ORB_PROFIT_MULTIPLIER
 """
 import logging
 import os
@@ -28,7 +34,9 @@ import alpaca_trade_api as tradeapi
 from config import (
     ORB_CLOSE_HOUR,
     ORB_CLOSE_MINUTE,
+    ORB_MIN_OR_PCT,
     ORB_PROFIT_MULTIPLIER,
+    ORB_PROFIT_MULTIPLIERS,
     ORB_RANGE_BARS,
     ORB_STOP_BUFFER,
     ORB_SYMBOLS,
@@ -119,10 +127,29 @@ def get_position(symbol: str):
 
 
 # ---------------------------------------------------------------------------
+# Improvement 1: SPY trend filter
+# ---------------------------------------------------------------------------
+
+def get_spy_trend() -> bool | None:
+    """
+    Return True if SPY is trending up today (latest close > session open).
+    Returns None if SPY data isn't available yet (before 10:00 ET).
+    """
+    bars = get_today_bars("SPY")
+    if bars is None or len(bars) < 1:
+        return None
+    spy_open = float(bars.iloc[0]["open"])
+    spy_last = float(bars.iloc[-1]["close"])
+    trending_up = spy_last >= spy_open
+    log.info(f"SPY trend: open={spy_open:.2f}  last={spy_last:.2f}  {'UP' if trending_up else 'DOWN'}")
+    return trending_up
+
+
+# ---------------------------------------------------------------------------
 # Strategy logic
 # ---------------------------------------------------------------------------
 
-def process_symbol(symbol: str) -> None:
+def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
     bars = get_today_bars(symbol)
     if bars is None:
         log.info(f"{symbol}: no bars yet")
@@ -135,8 +162,17 @@ def process_symbol(symbol: str) -> None:
 
     or_high, or_low, avg_or_volume = or_result
     or_range = or_high - or_low
+
+    # Improvement 2: skip narrow opening ranges
+    if ORB_MIN_OR_PCT > 0 and or_range / or_high < ORB_MIN_OR_PCT:
+        log.info(f"{symbol}: OR too narrow ({or_range / or_high:.3%} < {ORB_MIN_OR_PCT:.1%}) — skipping")
+        return
+
+    # Improvement 3: per-symbol profit multiplier
+    profit_multiplier = ORB_PROFIT_MULTIPLIERS.get(symbol, ORB_PROFIT_MULTIPLIER)
+
     stop_price = or_low - ORB_STOP_BUFFER
-    target_price = or_high + or_range * ORB_PROFIT_MULTIPLIER
+    target_price = or_high + or_range * profit_multiplier
 
     current_bar = bars.iloc[-1]
     current_price = float(current_bar["close"])
@@ -148,7 +184,7 @@ def process_symbol(symbol: str) -> None:
 
     log.info(
         f"{symbol} | Price: {current_price:.2f} | OR: {or_low:.2f}–{or_high:.2f}"
-        f" | Pos: {qty} | Time: {now_et.strftime('%H:%M')} ET"
+        f" | Pos: {qty} | Mult: {profit_multiplier:.1f}x | Time: {now_et.strftime('%H:%M')} ET"
     )
 
     # --- EOD forced close ---
@@ -186,6 +222,14 @@ def process_symbol(symbol: str) -> None:
         log.info(f"{symbol} | Already traded today — skipping entry")
         return
 
+    # Improvement 1: SPY trend filter
+    if spy_bullish is False:
+        log.info(f"{symbol} | SPY trending DOWN — skipping entry")
+        return
+    if spy_bullish is None:
+        log.info(f"{symbol} | SPY data not ready — skipping entry")
+        return
+
     vol_ok = current_volume >= avg_or_volume * ORB_VOLUME_FACTOR
 
     if current_price > or_high and vol_ok:
@@ -202,6 +246,7 @@ def process_symbol(symbol: str) -> None:
             f" | Stop: {stop_price:.2f}"
             f" | Target: {target_price:.2f}"
             f" | Vol ratio: {current_volume / avg_or_volume:.2f}x"
+            f" | Mult: {profit_multiplier:.1f}x"
         )
     elif current_price > or_high and not vol_ok:
         log.info(f"{symbol} | Price above OR high but volume too low ({current_volume / avg_or_volume:.2f}x < {ORB_VOLUME_FACTOR}x) — skipping")
@@ -226,15 +271,19 @@ def run_orb() -> None:
         log.info("Before 10:00 ET — building opening range, no trades yet")
         return
 
+    # Fetch SPY trend once and share across all symbols
+    spy_bullish = get_spy_trend()
+
     for symbol in ORB_SYMBOLS:
         try:
-            process_symbol(symbol)
+            process_symbol(symbol, spy_bullish)
         except Exception as e:
             log.error(f"{symbol}: unexpected error — {e}")
 
 
 if __name__ == "__main__":
     log.info(f"ORB Bot | Symbols: {', '.join(ORB_SYMBOLS)}")
-    log.info(f"OR: first {ORB_RANGE_BARS} bars | Target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
+    log.info(f"OR: first {ORB_RANGE_BARS} bars | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
+    log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | per-symbol multipliers")
     run_orb()
     log.info("Run complete")
