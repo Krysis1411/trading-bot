@@ -33,7 +33,7 @@ ET = ZoneInfo("America/New_York")
 class ORBConfig(StrategyConfig, frozen=True):
     instrument_id: InstrumentId
     bar_type: BarType
-    trade_size: Decimal
+    position_size_usd: float = 1_000.0   # dollars per trade; qty = floor(size / or_high)
     orb_range_bars: PositiveInt = 6
     profit_multiplier: PositiveFloat = 1.5
     volume_factor: PositiveFloat = 1.0
@@ -63,6 +63,7 @@ class ORBStrategy(Strategy):
         self._or_bars_seen: int = 0
         self._range_ready: bool = False
         self._range_skipped: bool = False
+        self._trade_qty: int = 0
         self._entry_price: float | None = None
         self._stop_price: float | None = None
         self._target_price: float | None = None
@@ -128,9 +129,10 @@ class ORBStrategy(Strategy):
                             f"OR too narrow ({or_range / self._or_high:.3%} < {self.config.min_or_pct:.3%}) — skipping day"
                         )
                     else:
+                        self._trade_qty = max(1, int(self.config.position_size_usd / self._or_high))
                         self.log.info(
                             f"OR ready | H={self._or_high:.2f}  L={self._or_low:.2f}"
-                            f"  Range={or_range:.2f}"
+                            f"  Range={or_range:.2f}  Qty={self._trade_qty}"
                         )
             return
 
@@ -183,13 +185,13 @@ class ORBStrategy(Strategy):
             order = self.order_factory.market(
                 instrument_id=self.config.instrument_id,
                 order_side=OrderSide.BUY,
-                quantity=self.instrument.make_qty(self.config.trade_size),
+                quantity=self.instrument.make_qty(Decimal(self._trade_qty)),
                 time_in_force=TimeInForce.IOC,
             )
             self.submit_order(order)
             self._entry_price = close
             self.log.info(
-                f"BUY BREAKOUT {close:.2f}"
+                f"BUY BREAKOUT {close:.2f}  qty={self._trade_qty}"
                 f"  stop={self._stop_price:.2f}"
                 f"  target={self._target_price:.2f}"
                 f"  vol_ratio={volume / avg_or_vol:.2f}x"

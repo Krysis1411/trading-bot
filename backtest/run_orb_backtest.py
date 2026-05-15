@@ -12,7 +12,6 @@ Usage
     python -m backtest.run_orb_backtest AAPL MSFT SPY QQQ NVDA
 """
 import sys
-from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -36,11 +35,11 @@ from config import (
     ORB_CLOSE_HOUR,
     ORB_CLOSE_MINUTE,
     ORB_MIN_OR_PCT,
+    ORB_POSITION_SIZE,
     ORB_PROFIT_MULTIPLIER,
     ORB_PROFIT_MULTIPLIERS,
     ORB_RANGE_BARS,
     ORB_STOP_BUFFER,
-    ORB_TRADE_QUANTITY,
     ORB_VOLUME_FACTOR,
 )
 from strategies.orb import ORBConfig, ORBStrategy
@@ -100,7 +99,7 @@ def run_orb_backtest(symbol: str = "AAPL") -> None:
         config=ORBConfig(
             instrument_id=instrument.id,
             bar_type=bar_type,
-            trade_size=Decimal(str(ORB_TRADE_QUANTITY)),
+            position_size_usd=float(ORB_POSITION_SIZE),
             orb_range_bars=ORB_RANGE_BARS,
             profit_multiplier=profit_multiplier,
             volume_factor=ORB_VOLUME_FACTOR,

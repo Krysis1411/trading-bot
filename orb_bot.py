@@ -35,12 +35,12 @@ from config import (
     ORB_CLOSE_HOUR,
     ORB_CLOSE_MINUTE,
     ORB_MIN_OR_PCT,
+    ORB_POSITION_SIZE,
     ORB_PROFIT_MULTIPLIER,
     ORB_PROFIT_MULTIPLIERS,
     ORB_RANGE_BARS,
     ORB_STOP_BUFFER,
     ORB_SYMBOLS,
-    ORB_TRADE_QUANTITY,
     ORB_VOLUME_FACTOR,
 )
 
@@ -170,6 +170,7 @@ def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
 
     # Improvement 3: per-symbol profit multiplier
     profit_multiplier = ORB_PROFIT_MULTIPLIERS.get(symbol, ORB_PROFIT_MULTIPLIER)
+    trade_qty = max(1, int(ORB_POSITION_SIZE / or_high))
 
     stop_price = or_low - ORB_STOP_BUFFER
     target_price = or_high + or_range * profit_multiplier
@@ -184,7 +185,7 @@ def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
 
     log.info(
         f"{symbol} | Price: {current_price:.2f} | OR: {or_low:.2f}–{or_high:.2f}"
-        f" | Pos: {qty} | Mult: {profit_multiplier:.1f}x | Time: {now_et.strftime('%H:%M')} ET"
+        f" | Qty: {trade_qty} | Pos: {qty} | Mult: {profit_multiplier:.1f}x | Time: {now_et.strftime('%H:%M')} ET"
     )
 
     # --- EOD forced close ---
@@ -235,14 +236,15 @@ def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
     if current_price > or_high and vol_ok:
         api.submit_order(
             symbol=symbol,
-            qty=ORB_TRADE_QUANTITY,
+            qty=trade_qty,
             side="buy",
             type="market",
             time_in_force="day",
         )
         log.info(
-            f"BUY BREAKOUT {ORB_TRADE_QUANTITY} {symbol}"
+            f"BUY BREAKOUT {trade_qty} {symbol}"
             f" | Price: ~{current_price:.2f}"
+            f" | Cost: ~${trade_qty * current_price:.0f}"
             f" | Stop: {stop_price:.2f}"
             f" | Target: {target_price:.2f}"
             f" | Vol ratio: {current_volume / avg_or_volume:.2f}x"
@@ -283,7 +285,7 @@ def run_orb() -> None:
 
 if __name__ == "__main__":
     log.info(f"ORB Bot | Symbols: {', '.join(ORB_SYMBOLS)}")
-    log.info(f"OR: first {ORB_RANGE_BARS} bars | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
+    log.info(f"OR: first {ORB_RANGE_BARS} bars | ${ORB_POSITION_SIZE}/trade | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
     log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | per-symbol multipliers")
     run_orb()
     log.info("Run complete")

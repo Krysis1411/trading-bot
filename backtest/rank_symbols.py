@@ -7,7 +7,6 @@ Usage
     python -m backtest.rank_symbols TSLA COIN MARA  # specific symbols
 """
 import sys
-from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -26,18 +25,19 @@ from nautilus_trader.model.objects import Money
 from nautilus_trader.persistence.wranglers import BarDataWrangler
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
+
 from backtest.fetch_data import fetch_bars, load_bars_df
 from config import (
     BACKTEST_STARTING_BALANCE,
     ORB_CLOSE_HOUR,
     ORB_CLOSE_MINUTE,
     ORB_MIN_OR_PCT,
+    ORB_POSITION_SIZE,
     ORB_PROFIT_MULTIPLIER,
     ORB_PROFIT_MULTIPLIERS,
     ORB_RANGE_BARS,
     ORB_STOP_BUFFER,
     ORB_SYMBOLS,
-    ORB_TRADE_QUANTITY,
     ORB_VOLUME_FACTOR,
 )
 from strategies.orb import ORBConfig, ORBStrategy
@@ -126,7 +126,7 @@ def backtest_symbol(symbol: str, spy_bars) -> dict | None:
                 config=ORBConfig(
                     instrument_id=instrument.id,
                     bar_type=bar_type,
-                    trade_size=Decimal(str(ORB_TRADE_QUANTITY)),
+                    position_size_usd=float(ORB_POSITION_SIZE),
                     orb_range_bars=ORB_RANGE_BARS,
                     profit_multiplier=profit_multiplier,
                     volume_factor=ORB_VOLUME_FACTOR,
@@ -186,7 +186,7 @@ def run_ranking(symbols: list[str]) -> None:
 
     print(f"\nRunning ORB ranking for {len(symbols)} symbols")
     print(f"Settings: {ORB_RANGE_BARS}-bar OR | default {ORB_PROFIT_MULTIPLIER}x target | "
-          f"{ORB_VOLUME_FACTOR}x vol | {ORB_TRADE_QUANTITY} shares | "
+          f"{ORB_VOLUME_FACTOR}x vol | ${ORB_POSITION_SIZE}/trade | "
           f"${BACKTEST_STARTING_BALANCE:,.0f} capital")
     print(f"Filters: min OR {ORB_MIN_OR_PCT:.1%} | SPY trend filter ON\n")
 
@@ -220,7 +220,7 @@ def run_ranking(symbols: list[str]) -> None:
     # Print ranked table
     w = 88
     print(f"\n{'='*w}")
-    print(f"  ORB SYMBOL RANKING  |  {ORB_TRADE_QUANTITY} shares/trade  |  60 days  |  ${BACKTEST_STARTING_BALANCE:,.0f} capital")
+    print(f"  ORB SYMBOL RANKING  |  ${ORB_POSITION_SIZE}/trade  |  60 days  |  ${BACKTEST_STARTING_BALANCE:,.0f} capital")
     print(f"  SPY trend filter ON  |  min OR {ORB_MIN_OR_PCT:.1%}  |  per-symbol multipliers")
     print(f"{'='*w}")
     print(f"  {'Rank':<5}{'Symbol':<8}{'Mult':>5}{'Trades':>6}{'Wins':>6}{'Win%':>7}{'Total P&L':>12}{'Avg/Trade':>11}{'Best':>10}{'Worst':>10}")
