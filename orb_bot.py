@@ -40,9 +40,10 @@ from config import (
     ORB_PROFIT_MULTIPLIERS,
     ORB_RANGE_BARS,
     ORB_STOP_BUFFER,
-    ORB_SYMBOLS,
     ORB_VOLUME_FACTOR,
+    MAX_TOTAL_INVESTMENT,
 )
+from screener import get_active_symbols
 
 load_dotenv()
 
@@ -149,16 +150,17 @@ def get_spy_trend() -> bool | None:
 # Strategy logic
 # ---------------------------------------------------------------------------
 
-def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
+def process_symbol(symbol: str, spy_bullish: bool | None, open_positions_count: int, max_open_positions: int) -> bool:
+    """Returns True if a new position was opened, False otherwise."""
     bars = get_today_bars(symbol)
     if bars is None:
         log.info(f"{symbol}: no bars yet")
-        return
+        return False
 
     or_result = compute_opening_range(bars)
     if or_result is None:
         log.info(f"{symbol}: opening range not ready yet ({len(bars)}/{ORB_RANGE_BARS} bars)")
-        return
+        return False
 
     or_high, or_low, avg_or_volume = or_result
     or_range = or_high - or_low
@@ -166,7 +168,7 @@ def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
     # Improvement 2: skip narrow opening ranges
     if ORB_MIN_OR_PCT > 0 and or_range / or_high < ORB_MIN_OR_PCT:
         log.info(f"{symbol}: OR too narrow ({or_range / or_high:.3%} < {ORB_MIN_OR_PCT:.1%}) — skipping")
-        return
+        return False
 
     # Improvement 3: per-symbol profit multiplier
     profit_multiplier = ORB_PROFIT_MULTIPLIERS.get(symbol, ORB_PROFIT_MULTIPLIER)
@@ -194,7 +196,7 @@ def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
             api.submit_order(symbol=symbol, qty=qty, side="sell",
                              type="market", time_in_force="day")
             log.info(f"EOD CLOSE — SELL {qty} {symbol} at ~{current_price:.2f}")
-        return
+        return False
 
     # --- Manage existing position ---
     if position:
@@ -204,36 +206,45 @@ def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
             api.submit_order(symbol=symbol, qty=qty, side="sell",
                              type="market", time_in_force="day")
             log.info(f"STOP LOSS — SELL {qty} {symbol} at ~{current_price:.2f} | P&L: {pnl_pct:.2f}%")
-            return
+            return False
 
         if current_price >= target_price:
             api.submit_order(symbol=symbol, qty=qty, side="sell",
                              type="market", time_in_force="day")
             log.info(f"TAKE PROFIT — SELL {qty} {symbol} at ~{current_price:.2f} | P&L: {pnl_pct:.2f}%")
-            return
+            return False
 
         log.info(
             f"{symbol} | Holding {qty} shares | P&L: {pnl_pct:.2f}%"
             f" | Stop: {stop_price:.2f} | Target: {target_price:.2f}"
         )
-        return
+        return False
 
     # --- Entry: breakout above OR high ---
     if already_traded_today(symbol):
         log.info(f"{symbol} | Already traded today — skipping entry")
-        return
+        return False
 
     # Improvement 1: SPY trend filter
     if spy_bullish is False:
         log.info(f"{symbol} | SPY trending DOWN — skipping entry")
-        return
+        return False
     if spy_bullish is None:
         log.info(f"{symbol} | SPY data not ready — skipping entry")
-        return
+        return False
 
     vol_ok = current_volume >= avg_or_volume * ORB_VOLUME_FACTOR
 
+    # Prevent entering trades where the price has already shot up to the target
+    if current_price >= target_price:
+        log.info(f"{symbol} | Price {current_price:.2f} already hit/exceeded target {target_price:.2f} — skipping entry")
+        return False
+
     if current_price > or_high and vol_ok:
+        if open_positions_count >= max_open_positions:
+            log.info(f"{symbol} | Budget limit reached ({open_positions_count}/{max_open_positions} trades open) — skipping entry to stay under ${MAX_TOTAL_INVESTMENT}")
+            return False
+            
         api.submit_order(
             symbol=symbol,
             qty=trade_qty,
@@ -250,10 +261,13 @@ def process_symbol(symbol: str, spy_bullish: bool | None) -> None:
             f" | Vol ratio: {current_volume / avg_or_volume:.2f}x"
             f" | Mult: {profit_multiplier:.1f}x"
         )
+        return True
     elif current_price > or_high and not vol_ok:
         log.info(f"{symbol} | Price above OR high but volume too low ({current_volume / avg_or_volume:.2f}x < {ORB_VOLUME_FACTOR}x) — skipping")
+        return False
     else:
         log.info(f"{symbol} | No breakout (price {current_price:.2f} vs OR high {or_high:.2f})")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -276,15 +290,32 @@ def run_orb() -> None:
     # Fetch SPY trend once and share across all symbols
     spy_bullish = get_spy_trend()
 
-    for symbol in ORB_SYMBOLS:
+    # Fetch dynamic symbols using OpenBB screener
+    active_symbols = get_active_symbols()
+    if not active_symbols:
+        log.warning("No active symbols found. Skipping run.")
+        return
+
+    # Budget setup
+    try:
+        open_positions_count = len(api.list_positions())
+    except Exception as e:
+        log.error(f"Failed to fetch existing positions: {e}")
+        open_positions_count = 0
+        
+    max_open_positions = max(1, int(MAX_TOTAL_INVESTMENT / ORB_POSITION_SIZE))
+
+    for symbol in active_symbols:
         try:
-            process_symbol(symbol, spy_bullish)
+            opened_new = process_symbol(symbol, spy_bullish, open_positions_count, max_open_positions)
+            if opened_new:
+                open_positions_count += 1
         except Exception as e:
             log.error(f"{symbol}: unexpected error — {e}")
 
 
 if __name__ == "__main__":
-    log.info(f"ORB Bot | Symbols: {', '.join(ORB_SYMBOLS)}")
+    log.info("ORB Bot starting (Dynamic Symbols via OpenBB)")
     log.info(f"OR: first {ORB_RANGE_BARS} bars | ${ORB_POSITION_SIZE}/trade | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
     log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | per-symbol multipliers")
     run_orb()
