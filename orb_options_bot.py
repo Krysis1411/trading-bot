@@ -1,7 +1,7 @@
 """
 Live ORB (Opening Range Breakout) day trading bot — Alpaca options paper trading.
-Leverages the OpenBB SDK to fetch options chains, evaluate Implied Volatility (IV),
-and dynamically submit multi-leg defined-risk orders (Spreads, Straddles, Iron Condors).
+Fetches options chains via yfinance, evaluates Implied Volatility (IV),
+and dynamically submits multi-leg defined-risk orders (Spreads, Straddles, Iron Condors).
 """
 import logging
 import os
@@ -12,12 +12,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from dotenv import load_dotenv
 
+import yfinance as yf
 import alpaca_trade_api as tradeapi
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest, OptionLegRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass, PositionSide
-
-from openbb import obb
 
 from config import (
     ORB_CLOSE_HOUR,
@@ -63,9 +62,6 @@ trading_client = TradingClient(key, secret, paper=True)
 
 ET = ZoneInfo("America/New_York")
 CLOSE_TIME = time(ORB_CLOSE_HOUR, ORB_CLOSE_MINUTE)
-
-# Set OpenBB output to dataframe
-obb.user.preferences.output_type = "dataframe"
 
 
 # ---------------------------------------------------------------------------
@@ -280,47 +276,43 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
         log.info(f"{symbol} | No option setup found (Price: {current_price:.2f} | OR: {or_low:.2f}–{or_high:.2f})")
         return False
 
-    # Fetch option chain via OpenBB
+    # Fetch option chain via yfinance
     try:
-        log.info(f"{symbol} | Fetching option chain via OpenBB...")
-        res = obb.derivatives.options.chains(symbol=symbol, provider="yfinance")
-        df = res.to_df() if hasattr(res, "to_df") else res
+        log.info(f"{symbol} | Fetching option chain via yfinance...")
+        ticker = yf.Ticker(symbol)
+        available = ticker.options  # tuple of expiry strings e.g. ('2026-05-30', ...)
+        if not available:
+            log.warning(f"{symbol} | No options expirations available")
+            return False
+
+        today_str = date.today().isoformat()
+        valid_exps = [e for e in available if e >= today_str]
+        if not valid_exps:
+            log.warning(f"{symbol} | No valid expirations found")
+            return False
+
+        nearest_expiry = valid_exps[0]
+        chain = ticker.option_chain(nearest_expiry)
+        calls = chain.calls
+        puts = chain.puts
     except Exception as e:
-        log.error(f"{symbol} | Failed to fetch option chain via OpenBB: {e}")
+        log.error(f"{symbol} | Failed to fetch option chain: {e}")
         return False
 
-    if df.empty:
-        log.warning(f"{symbol} | Option chain is empty")
-        return False
-
-    # Filter for nearest expiration date >= today
-    df['expiration'] = pd.to_datetime(df['expiration']).dt.date
-    today_val = date.today()
-    df_valid = df[df['expiration'] >= today_val]
-    if df_valid.empty:
-        log.warning(f"{symbol} | No valid expirations found")
-        return False
-
-    expirations = sorted(df_valid['expiration'].unique())
-    nearest_expiry = expirations[0]
-    df_near = df_valid[df_valid['expiration'] == nearest_expiry]
-
-    calls = df_near[df_near['option_type'] == 'call']
-    puts = df_near[df_near['option_type'] == 'put']
     if calls.empty or puts.empty:
-        log.warning(f"{symbol} | Missing Call or Put contracts in near chain")
+        log.warning(f"{symbol} | Missing Call or Put contracts for expiry {nearest_expiry}")
         return False
 
     # Sort strikes by closeness to current price to find ATM contracts
     calls_sorted = calls.iloc[(calls['strike'] - current_price).abs().argsort()]
     puts_sorted = puts.iloc[(puts['strike'] - current_price).abs().argsort()]
-    
+
     atm_call = calls_sorted.iloc[0]
     atm_put = puts_sorted.iloc[0]
-    
-    avg_atm_iv = (float(atm_call['implied_volatility']) + float(atm_put['implied_volatility'])) / 2
-    log.info(f"{symbol} | ATM Call: {atm_call['contract_symbol']} (Strike: {atm_call['strike']} | Ask: {atm_call['ask']})")
-    log.info(f"{symbol} | ATM Put: {atm_put['contract_symbol']} (Strike: {atm_put['strike']} | Ask: {atm_put['ask']})")
+
+    avg_atm_iv = (float(atm_call['impliedVolatility']) + float(atm_put['impliedVolatility'])) / 2
+    log.info(f"{symbol} | ATM Call: {atm_call['contractSymbol']} (Strike: {atm_call['strike']} | Ask: {atm_call['ask']})")
+    log.info(f"{symbol} | ATM Put: {atm_put['contractSymbol']} (Strike: {atm_put['strike']} | Ask: {atm_put['ask']})")
     log.info(f"{symbol} | Average ATM IV: {avg_atm_iv:.2%}")
 
     strategy = None
@@ -383,10 +375,10 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
         
         qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (risk * 100)))
         legs = [
-            OptionLegRequest(symbol=short_call['contract_symbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
-            OptionLegRequest(symbol=long_call['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-            OptionLegRequest(symbol=short_put['contract_symbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
-            OptionLegRequest(symbol=long_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+            OptionLegRequest(symbol=short_call['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+            OptionLegRequest(symbol=long_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+            OptionLegRequest(symbol=short_put['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+            OptionLegRequest(symbol=long_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
         ]
         limit_price = -round(net_credit, 2)  # negative = credit received
         log.info(f"{symbol} | Iron Condor | Credit: ${net_credit:.2f} | Risk: ${risk:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
@@ -411,8 +403,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                 
                 qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
                 legs = [
-                    OptionLegRequest(symbol=long_call['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=short_call['contract_symbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+                    OptionLegRequest(symbol=long_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                    OptionLegRequest(symbol=short_call['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
                 ]
                 limit_price = round(net_debit, 2)  # positive = debit paid
                 log.info(f"{symbol} | Bull Call Spread | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
@@ -422,8 +414,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                 net_debit = float(atm_call['ask']) + float(atm_put['ask'])
                 qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
                 legs = [
-                    OptionLegRequest(symbol=atm_call['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=atm_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                    OptionLegRequest(symbol=atm_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                    OptionLegRequest(symbol=atm_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                 ]
                 limit_price = round(net_debit, 2)  # positive = debit paid
                 log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
@@ -446,8 +438,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
 
                 qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
                 legs = [
-                    OptionLegRequest(symbol=long_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=short_put['contract_symbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+                    OptionLegRequest(symbol=long_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                    OptionLegRequest(symbol=short_put['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
                 ]
                 limit_price = round(net_debit, 2)  # positive = debit paid
                 log.info(f"{symbol} | Bear Put Spread | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
@@ -457,8 +449,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                 net_debit = float(atm_call['ask']) + float(atm_put['ask'])
                 qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
                 legs = [
-                    OptionLegRequest(symbol=atm_call['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=atm_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                    OptionLegRequest(symbol=atm_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                    OptionLegRequest(symbol=atm_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                 ]
                 limit_price = round(net_debit, 2)  # positive = debit paid
                 log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")

@@ -2,5 +2,6 @@ alpaca-trade-api==3.2.0
 pandas==2.3.3
 python-dotenv==1.1.0
 alpaca-py==0.43.4
-openbb==4.7.2
+yfinance==0.2.59
+requests==2.32.3
 
