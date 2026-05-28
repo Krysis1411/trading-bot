@@ -290,28 +290,45 @@ def run_orb() -> None:
     # Fetch SPY trend once and share across all symbols
     spy_bullish = get_spy_trend()
 
-    # Fetch dynamic symbols using OpenBB screener
-    active_symbols = get_active_symbols()
-    if not active_symbols:
-        log.warning("No active symbols found. Skipping run.")
-        return
-
-    # Budget setup
+    # -----------------------------------------------------------------------
+    # STEP 1: Always manage ALL currently held positions first.
+    # This ensures stop-loss, take-profit, and EOD close fire even when a
+    # held symbol is not in today's screener list.
+    # -----------------------------------------------------------------------
     try:
-        open_positions_count = len(api.list_positions())
+        open_positions = api.list_positions()
     except Exception as e:
         log.error(f"Failed to fetch existing positions: {e}")
-        open_positions_count = 0
-        
+        open_positions = []
+
+    held_symbols = set()
+    for pos in open_positions:
+        held_symbols.add(pos.symbol)
+        try:
+            process_symbol(pos.symbol, spy_bullish, len(open_positions), 0)
+        except Exception as e:
+            log.error(f"{pos.symbol}: unexpected error managing position — {e}")
+
+    open_positions_count = len(open_positions)
     max_open_positions = max(1, int(MAX_TOTAL_INVESTMENT / ORB_POSITION_SIZE))
 
-    for symbol in active_symbols:
-        try:
-            opened_new = process_symbol(symbol, spy_bullish, open_positions_count, max_open_positions)
-            if opened_new:
-                open_positions_count += 1
-        except Exception as e:
-            log.error(f"{symbol}: unexpected error — {e}")
+    # -----------------------------------------------------------------------
+    # STEP 2: Screen for new entry opportunities (skip already-held symbols).
+    # -----------------------------------------------------------------------
+    active_symbols = get_active_symbols()
+    if not active_symbols:
+        log.warning("No active symbols found from screener. Skipping new entries.")
+    else:
+        for symbol in active_symbols:
+            if symbol in held_symbols:
+                # Already managed above — don't double-process
+                continue
+            try:
+                opened_new = process_symbol(symbol, spy_bullish, open_positions_count, max_open_positions)
+                if opened_new:
+                    open_positions_count += 1
+            except Exception as e:
+                log.error(f"{symbol}: unexpected error — {e}")
 
 
 if __name__ == "__main__":
