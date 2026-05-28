@@ -290,12 +290,17 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
             return False
 
         nearest_expiry = valid_exps[0]
+        is_0dte = nearest_expiry == today_str
         chain = ticker.option_chain(nearest_expiry)
         calls = chain.calls
         puts = chain.puts
     except Exception as e:
         log.error(f"{symbol} | Failed to fetch option chain: {e}")
         return False
+
+    if is_0dte:
+        log.info(f"{symbol} | 0DTE — expiry today ({nearest_expiry}). "
+                 "Lowering IV threshold to aggressively favour Iron Condors (rapid theta decay).")
 
     if calls.empty or puts.empty:
         log.warning(f"{symbol} | Missing Call or Put contracts for expiry {nearest_expiry}")
@@ -318,7 +323,11 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
     qty = 0
     limit_price = 0.05  # set per strategy below; positive = debit, negative = credit
 
-    if avg_atm_iv > ORB_OPTIONS_IV_THRESHOLD and is_range_bound:
+    # On 0DTE, IV is structurally elevated and collapses to zero by close.
+    # Lower the threshold so range-bound plays are always treated as IC.
+    iv_threshold = ORB_OPTIONS_IV_THRESHOLD * (0.75 if is_0dte else 1.0)
+
+    if avg_atm_iv > iv_threshold and is_range_bound:
         # Strategy: Iron Condor (High IV & Range-bound)
         strategy = "Iron Condor"
         
@@ -381,7 +390,7 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
         limit_price = -round(net_credit, 2)  # negative = credit received
         log.info(f"{symbol} | Iron Condor | Credit: ${net_credit:.2f} | Risk: ${risk:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
-    elif avg_atm_iv <= ORB_OPTIONS_IV_THRESHOLD:
+    elif avg_atm_iv <= iv_threshold:
         # Low IV: we BUY premium
         if is_breakout_above:
             if spy_bullish is True:
@@ -567,6 +576,22 @@ def run_orb_options() -> None:
 
     now_et = get_now_et()
     log.info(f"--- ORB Options check at {now_et.strftime('%H:%M')} ET ---")
+
+    # Hard EOD sweep — close all options legs directly from positions list,
+    # no bar data needed. Prevents overnight holds even if bar fetch fails.
+    if not DRY_RUN and now_et.time() >= CLOSE_TIME:
+        log.info("EOD — force-closing all options positions")
+        try:
+            all_pos = trading_client.get_all_positions()
+            options_legs = [p for p in all_pos if p.asset_class == AssetClass.US_OPTION]
+            if options_legs:
+                close_all_legs(options_legs)
+                log.info(f"EOD closed {len(options_legs)} options legs")
+            else:
+                log.info("EOD: no open options positions")
+        except Exception as e:
+            log.error(f"EOD options sweep failed: {e}")
+        return
 
     # Before 10:00 AM: opening range not ready
     if now_et.time() < time(10, 0):

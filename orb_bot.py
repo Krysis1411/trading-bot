@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, AssetClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -287,6 +287,28 @@ def run_orb() -> None:
 
     now_et = get_now_et()
     log.info(f"--- ORB check at {now_et.strftime('%H:%M')} ET ---")
+
+    # Hard EOD sweep — runs directly from the positions list, no bar data needed.
+    # Prevents overnight holds even if bar fetching fails at close time.
+    if now_et.time() >= CLOSE_TIME:
+        log.info("EOD — force-closing all equity positions")
+        try:
+            for pos in trading_client.get_all_positions():
+                if pos.asset_class != AssetClass.US_EQUITY:
+                    continue
+                qty = abs(int(float(pos.qty)))
+                if qty > 0:
+                    try:
+                        trading_client.submit_order(MarketOrderRequest(
+                            symbol=pos.symbol, qty=qty,
+                            side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+                        ))
+                        log.info(f"EOD CLOSE — {pos.symbol} × {qty}")
+                    except Exception as e:
+                        log.error(f"EOD close failed for {pos.symbol}: {e}")
+        except Exception as e:
+            log.error(f"EOD sweep failed: {e}")
+        return
 
     # Before 10:00 AM: opening range not ready for any symbol
     if now_et.time() < time(10, 0):
