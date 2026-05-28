@@ -1,3 +1,6 @@
 alpaca-trade-api==3.2.0
 pandas==2.3.3
 python-dotenv==0.21.0
+alpaca-py==0.43.4
+openbb==4.7.2
+

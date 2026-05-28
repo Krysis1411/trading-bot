@@ -1,0 +1,31 @@
+name: ORB Options Bot
+
+on:
+  schedule:
+    # Every 5 minutes Mon-Fri, 13:30-20:30 UTC (9:30am-4:30pm EDT)
+    # Runs slightly past 4pm to catch the forced EOD close at 3:45pm ET
+    - cron: '*/5 13-20 * * 1-5'
+  workflow_dispatch: # Manual trigger from GitHub Actions UI
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  run-orb-options-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run ORB options bot
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python orb_options_bot.py
