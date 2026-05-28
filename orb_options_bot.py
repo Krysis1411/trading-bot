@@ -13,10 +13,12 @@ import pandas as pd
 from dotenv import load_dotenv
 
 import yfinance as yf
-import alpaca_trade_api as tradeapi
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest, OptionLegRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass, PositionSide
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, GetOptionContractsRequest, OptionLegRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass, PositionSide, QueryOrderStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from config import (
     ORB_CLOSE_HOUR,
@@ -49,16 +51,8 @@ secret = os.environ.get("ALPACA_SECRET_KEY") or os.environ.get("ALPACA_API_SECRE
 if not key or not secret:
     raise EnvironmentError("Missing ALPACA_API_KEY or ALPACA_SECRET_KEY/ALPACA_API_SECRET in environment")
 
-# Legacy client for bars fetching
-api = tradeapi.REST(
-    key,
-    secret,
-    "https://paper-api.alpaca.markets",
-    api_version="v2",
-)
-
-# Modern client for options / multi-leg orders
 trading_client = TradingClient(key, secret, paper=True)
+data_client = StockHistoricalDataClient(key, secret)
 
 ET = ZoneInfo("America/New_York")
 CLOSE_TIME = time(ORB_CLOSE_HOUR, ORB_CLOSE_MINUTE)
@@ -100,13 +94,17 @@ def get_today_bars(symbol: str) -> pd.DataFrame | None:
     market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
 
     try:
-        bars = api.get_bars(
-            symbol,
-            "5Min",
-            start=market_open.isoformat(),
-            limit=100,
-        ).df
-        return bars if not bars.empty else None
+        response = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            start=market_open,
+        ))
+        df = response.df
+        if df.empty:
+            return None
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.loc[symbol]
+        return df if not df.empty else None
     except Exception as e:
         log.error(f"{symbol}: failed to fetch bars — {e}")
         return None
@@ -137,10 +135,10 @@ def already_traded_today(symbol: str) -> bool:
     """Return True if an options order was already placed for this symbol today."""
     today_start = get_now_et().replace(hour=0, minute=0, second=0, microsecond=0)
     try:
-        orders = api.list_orders(
-            status="all",
-            after=today_start.isoformat(),
-        )
+        orders = trading_client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            after=today_start,
+        ))
         for o in orders:
             if get_underlying_symbol(o.symbol) == symbol:
                 return True
@@ -559,7 +557,7 @@ def manage_existing_options_positions(underlying_symbol: str, positions: list, s
 # ---------------------------------------------------------------------------
 
 def run_orb_options() -> None:
-    if not DRY_RUN and not api.get_clock().is_open:
+    if not DRY_RUN and not trading_client.get_clock().is_open:
         log.info("Market closed — skipping run")
         return
 

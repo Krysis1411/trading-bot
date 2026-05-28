@@ -43,7 +43,10 @@ _ALPACA_LOOKBACK_DAYS = {
 
 
 def _fetch_alpaca(symbol: str, interval: str, output_dir: str) -> str:
-    import alpaca_trade_api as tradeapi
+    try:
+        import alpaca_trade_api as tradeapi
+    except ImportError:
+        raise EnvironmentError("alpaca-trade-api not installed — falling back to yfinance")
 
     api_key = os.environ.get("ALPACA_API_KEY")
     secret_key = os.environ.get("ALPACA_SECRET_KEY")

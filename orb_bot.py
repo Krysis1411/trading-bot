@@ -29,7 +29,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from dotenv import load_dotenv
 
-import alpaca_trade_api as tradeapi
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from config import (
     ORB_CLOSE_HOUR,
@@ -53,12 +58,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-api = tradeapi.REST(
-    os.environ["ALPACA_API_KEY"],
-    os.environ["ALPACA_SECRET_KEY"],
-    "https://paper-api.alpaca.markets",
-    api_version="v2",
-)
+_key = os.environ["ALPACA_API_KEY"]
+_secret = os.environ["ALPACA_SECRET_KEY"]
+trading_client = TradingClient(_key, _secret, paper=True)
+data_client = StockHistoricalDataClient(_key, _secret)
 
 ET = ZoneInfo("America/New_York")
 CLOSE_TIME = time(ORB_CLOSE_HOUR, ORB_CLOSE_MINUTE)
@@ -78,13 +81,17 @@ def get_today_bars(symbol: str) -> pd.DataFrame | None:
     market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
 
     try:
-        bars = api.get_bars(
-            symbol,
-            "5Min",
-            start=market_open.isoformat(),
-            limit=100,
-        ).df
-        return bars if not bars.empty else None
+        response = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            start=market_open,
+        ))
+        df = response.df
+        if df.empty:
+            return None
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.loc[symbol]
+        return df if not df.empty else None
     except Exception as e:
         log.error(f"{symbol}: failed to fetch bars — {e}")
         return None
@@ -109,12 +116,12 @@ def already_traded_today(symbol: str) -> bool:
     """Return True if a buy order was already filled for this symbol today."""
     today_start = get_now_et().replace(hour=0, minute=0, second=0, microsecond=0)
     try:
-        orders = api.list_orders(
-            status="filled",
-            after=today_start.isoformat(),
-            direction="asc",
-        )
-        return any(o.symbol == symbol and o.side == "buy" for o in orders)
+        orders = trading_client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.FILLED,
+            after=today_start,
+            symbols=[symbol],
+        ))
+        return any(o.side == OrderSide.BUY for o in orders)
     except Exception as e:
         log.warning(f"{symbol}: could not check today's orders — {e}")
         return False
@@ -122,7 +129,7 @@ def already_traded_today(symbol: str) -> bool:
 
 def get_position(symbol: str):
     try:
-        return api.get_position(symbol)
+        return trading_client.get_open_position(symbol)
     except Exception:
         return None
 
@@ -193,8 +200,9 @@ def process_symbol(symbol: str, spy_bullish: bool | None, open_positions_count: 
     # --- EOD forced close ---
     if now_et.time() >= CLOSE_TIME:
         if position:
-            api.submit_order(symbol=symbol, qty=qty, side="sell",
-                             type="market", time_in_force="day")
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+            ))
             log.info(f"EOD CLOSE — SELL {qty} {symbol} at ~{current_price:.2f}")
         return False
 
@@ -203,14 +211,16 @@ def process_symbol(symbol: str, spy_bullish: bool | None, open_positions_count: 
         pnl_pct = float(position.unrealized_plpc) * 100
 
         if current_price <= stop_price:
-            api.submit_order(symbol=symbol, qty=qty, side="sell",
-                             type="market", time_in_force="day")
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+            ))
             log.info(f"STOP LOSS — SELL {qty} {symbol} at ~{current_price:.2f} | P&L: {pnl_pct:.2f}%")
             return False
 
         if current_price >= target_price:
-            api.submit_order(symbol=symbol, qty=qty, side="sell",
-                             type="market", time_in_force="day")
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+            ))
             log.info(f"TAKE PROFIT — SELL {qty} {symbol} at ~{current_price:.2f} | P&L: {pnl_pct:.2f}%")
             return False
 
@@ -245,13 +255,9 @@ def process_symbol(symbol: str, spy_bullish: bool | None, open_positions_count: 
             log.info(f"{symbol} | Budget limit reached ({open_positions_count}/{max_open_positions} trades open) — skipping entry to stay under ${MAX_TOTAL_INVESTMENT}")
             return False
             
-        api.submit_order(
-            symbol=symbol,
-            qty=trade_qty,
-            side="buy",
-            type="market",
-            time_in_force="day",
-        )
+        trading_client.submit_order(MarketOrderRequest(
+            symbol=symbol, qty=trade_qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+        ))
         log.info(
             f"BUY BREAKOUT {trade_qty} {symbol}"
             f" | Price: ~{current_price:.2f}"
@@ -275,7 +281,7 @@ def process_symbol(symbol: str, spy_bullish: bool | None, open_positions_count: 
 # ---------------------------------------------------------------------------
 
 def run_orb() -> None:
-    if not api.get_clock().is_open:
+    if not trading_client.get_clock().is_open:
         log.info("Market closed — skipping run")
         return
 
@@ -296,7 +302,7 @@ def run_orb() -> None:
     # held symbol is not in today's screener list.
     # -----------------------------------------------------------------------
     try:
-        open_positions = api.list_positions()
+        open_positions = trading_client.get_all_positions()
     except Exception as e:
         log.error(f"Failed to fetch existing positions: {e}")
         open_positions = []
