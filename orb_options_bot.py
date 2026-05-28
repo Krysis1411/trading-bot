@@ -14,8 +14,8 @@ from dotenv import load_dotenv
 
 import alpaca_trade_api as tradeapi
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOptionContractsRequest, OptionLegRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOptionContractsRequest, OptionLegRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass, PositionSide
 
 from openbb import obb
 
@@ -35,6 +35,8 @@ from config import (
 from screener import get_active_symbols
 
 load_dotenv()
+
+DRY_RUN = False  # Overridden to True by --dry-run CLI flag
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +66,28 @@ CLOSE_TIME = time(ORB_CLOSE_HOUR, ORB_CLOSE_MINUTE)
 
 # Set OpenBB output to dataframe
 obb.user.preferences.output_type = "dataframe"
+
+
+# ---------------------------------------------------------------------------
+# Account validation
+# ---------------------------------------------------------------------------
+
+def check_options_approval() -> bool:
+    """Return True if the account has options Level 2+ (required for spreads and condors)."""
+    try:
+        account = trading_client.get_account()
+        level = int(getattr(account, "options_approved_level", 0) or 0)
+        if level < 2:
+            log.warning(
+                f"Options approval level {level} — Level 2 required for multi-leg strategies. "
+                "Enable options trading in your Alpaca account settings."
+            )
+            return False
+        log.info(f"Options approval: Level {level} confirmed")
+        return True
+    except Exception as e:
+        log.warning(f"Could not verify options approval level: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -183,15 +207,18 @@ def classify_holding(positions: list) -> str:
 def close_all_legs(positions: list) -> None:
     """Submit market orders to close all positions in the list."""
     for pos in positions:
+        if DRY_RUN:
+            log.info(f"[DRY RUN] Would close {pos.symbol} (Qty: {pos.qty})")
+            continue
         try:
-            side = "sell" if pos.side == "long" else "buy"
-            api.submit_order(
+            close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+            req = MarketOrderRequest(
                 symbol=pos.symbol,
                 qty=abs(int(float(pos.qty))),
-                side=side,
-                type="market",
-                time_in_force="day",
+                side=close_side,
+                time_in_force=TimeInForce.DAY,
             )
+            trading_client.submit_order(req)
             log.info(f"Closed leg {pos.symbol} (Qty: {pos.qty})")
         except Exception as e:
             log.error(f"Failed to close leg {pos.symbol}: {e}")
@@ -299,6 +326,7 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
     strategy = None
     legs = []
     qty = 0
+    limit_price = 0.05  # set per strategy below; positive = debit, negative = credit
 
     if avg_atm_iv > ORB_OPTIONS_IV_THRESHOLD and is_range_bound:
         # Strategy: Iron Condor (High IV & Range-bound)
@@ -360,7 +388,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
             OptionLegRequest(symbol=short_put['contract_symbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
             OptionLegRequest(symbol=long_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
         ]
-        log.info(f"{symbol} | Iron Condor | Credit: ${net_credit:.2f} | Risk: ${risk:.2f} | Qty: {qty}")
+        limit_price = -round(net_credit, 2)  # negative = credit received
+        log.info(f"{symbol} | Iron Condor | Credit: ${net_credit:.2f} | Risk: ${risk:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
     elif avg_atm_iv <= ORB_OPTIONS_IV_THRESHOLD:
         # Low IV: we BUY premium
@@ -385,7 +414,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                     OptionLegRequest(symbol=long_call['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                     OptionLegRequest(symbol=short_call['contract_symbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
                 ]
-                log.info(f"{symbol} | Bull Call Spread | Debit: ${net_debit:.2f} | Qty: {qty}")
+                limit_price = round(net_debit, 2)  # positive = debit paid
+                log.info(f"{symbol} | Bull Call Spread | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
             else:
                 # Straddle (uncorrelated breakout)
                 strategy = "Straddle"
@@ -395,7 +425,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                     OptionLegRequest(symbol=atm_call['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                     OptionLegRequest(symbol=atm_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                 ]
-                log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty}")
+                limit_price = round(net_debit, 2)  # positive = debit paid
+                log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
         elif is_breakout_below:
             if spy_bullish is False:
@@ -418,7 +449,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                     OptionLegRequest(symbol=long_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                     OptionLegRequest(symbol=short_put['contract_symbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
                 ]
-                log.info(f"{symbol} | Bear Put Spread | Debit: ${net_debit:.2f} | Qty: {qty}")
+                limit_price = round(net_debit, 2)  # positive = debit paid
+                log.info(f"{symbol} | Bear Put Spread | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
             else:
                 # Straddle (uncorrelated breakdown)
                 strategy = "Straddle"
@@ -428,22 +460,33 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                     OptionLegRequest(symbol=atm_call['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                     OptionLegRequest(symbol=atm_put['contract_symbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
                 ]
-                log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty}")
+                limit_price = round(net_debit, 2)  # positive = debit paid
+                log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
     if strategy is None:
         log.info(f"{symbol} | No options setup matched the criteria (IV: {avg_atm_iv:.2%})")
         return False
 
     # Place MLEG order
+    # limit_price: positive = net debit (we pay), negative = net credit (we receive)
+    if DRY_RUN:
+        log.info(
+            f"[DRY RUN] Would submit {strategy} for {symbol}"
+            f" | Legs: {[l.symbol for l in legs]}"
+            f" | Qty: {qty} | Limit: ${limit_price:.2f}"
+        )
+        return True
+
     try:
-        req = MarketOrderRequest(
+        req = LimitOrderRequest(
             qty=qty,
+            limit_price=limit_price,
             order_class=OrderClass.MLEG,
             time_in_force=TimeInForce.DAY,
-            legs=legs
+            legs=legs,
         )
         order = trading_client.submit_order(req)
-        log.info(f"🚀 SUBMITTED {strategy} Order for {symbol} | ID: {order.id} | Qty: {qty}")
+        log.info(f"SUBMITTED {strategy} for {symbol} | ID: {order.id} | Qty: {qty} | Limit: ${limit_price:.2f}")
         return True
     except Exception as e:
         log.error(f"{symbol} | Failed to submit MLEG order: {e}")
@@ -524,8 +567,12 @@ def manage_existing_options_positions(underlying_symbol: str, positions: list, s
 # ---------------------------------------------------------------------------
 
 def run_orb_options() -> None:
-    if not api.get_clock().is_open:
+    if not DRY_RUN and not api.get_clock().is_open:
         log.info("Market closed — skipping run")
+        return
+
+    if not DRY_RUN and not check_options_approval():
+        log.error("Options Level 2 not approved — cannot submit multi-leg orders. Exiting.")
         return
 
     now_et = get_now_et()
@@ -586,6 +633,20 @@ def run_orb_options() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ORB Options Bot")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Log strategy selection and leg structure without submitting any orders",
+    )
+    args = parser.parse_args()
+    DRY_RUN = args.dry_run
+
+    if DRY_RUN:
+        log.info("*** DRY RUN MODE — no orders will be submitted ***")
+
     log.info("ORB Options Bot starting (Dynamic Symbols via OpenBB)")
     log.info(f"OR: first {ORB_RANGE_BARS} bars | ${ORB_OPTIONS_POSITION_SIZE}/trade | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
     log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | IV boundary {ORB_OPTIONS_IV_THRESHOLD:.0%}")
