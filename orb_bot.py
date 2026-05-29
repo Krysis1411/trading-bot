@@ -52,6 +52,18 @@ from screener import get_active_symbols
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Optional ML scorer — loaded at startup if model exists; bot runs without it
+# ---------------------------------------------------------------------------
+try:
+    import joblib
+    from ml.features import ML_CONFIDENCE_THRESHOLD, compute_features
+    _SCORER = joblib.load("ml/models/breakout_scorer.pkl")
+    _ML_ENABLED = True
+except Exception:
+    _SCORER = None
+    _ML_ENABLED = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -138,26 +150,28 @@ def get_position(symbol: str):
 # Improvement 1: SPY trend filter
 # ---------------------------------------------------------------------------
 
-def get_spy_trend() -> bool | None:
+def get_spy_trend() -> tuple[bool | None, float]:
     """
-    Return True if SPY is trending up today (latest close > session open).
-    Returns None if SPY data isn't available yet (before 10:00 ET).
+    Return (is_trending_up, trend_pct) for SPY today.
+    trend_pct = (last - open) / open; 0.0 if data unavailable.
     """
     bars = get_today_bars("SPY")
     if bars is None or len(bars) < 1:
-        return None
+        return None, 0.0
     spy_open = float(bars.iloc[0]["open"])
     spy_last = float(bars.iloc[-1]["close"])
+    trend_pct = (spy_last - spy_open) / spy_open if spy_open > 0 else 0.0
     trending_up = spy_last >= spy_open
-    log.info(f"SPY trend: open={spy_open:.2f}  last={spy_last:.2f}  {'UP' if trending_up else 'DOWN'}")
-    return trending_up
+    log.info(f"SPY trend: open={spy_open:.2f}  last={spy_last:.2f}  {'UP' if trending_up else 'DOWN'}  ({trend_pct:+.2%})")
+    return trending_up, trend_pct
 
 
 # ---------------------------------------------------------------------------
 # Strategy logic
 # ---------------------------------------------------------------------------
 
-def process_symbol(symbol: str, spy_bullish: bool | None, open_positions_count: int, max_open_positions: int) -> bool:
+def process_symbol(symbol: str, spy_bullish: bool | None, spy_trend_pct: float,
+                   open_positions_count: int, max_open_positions: int) -> bool:
     """Returns True if a new position was opened, False otherwise."""
     bars = get_today_bars(symbol)
     if bars is None:
@@ -254,7 +268,24 @@ def process_symbol(symbol: str, spy_bullish: bool | None, open_positions_count: 
         if open_positions_count >= max_open_positions:
             log.info(f"{symbol} | Budget limit reached ({open_positions_count}/{max_open_positions} trades open) — skipping entry to stay under ${MAX_TOTAL_INVESTMENT}")
             return False
-            
+
+        # Optional ML gate — only active once breakout_scorer.pkl exists
+        if _ML_ENABLED:
+            feats = compute_features(
+                or_high=or_high, or_low=or_low,
+                breakout_price=current_price,
+                volume=current_volume, avg_or_volume=avg_or_volume,
+                bar_et=now_et,
+                spy_open=None, spy_last=None,   # pass raw trend pct instead
+            )
+            # Override spy_trend_pct with the value fetched once in run_orb()
+            feats[4] = spy_trend_pct
+            confidence = _SCORER.predict_proba([feats])[0][1]
+            log.info(f"{symbol} | ML confidence: {confidence:.0%}")
+            if confidence < ML_CONFIDENCE_THRESHOLD:
+                log.info(f"{symbol} | ML score below threshold ({ML_CONFIDENCE_THRESHOLD:.0%}) — skipping entry")
+                return False
+
         trading_client.submit_order(MarketOrderRequest(
             symbol=symbol, qty=trade_qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
         ))
@@ -316,7 +347,7 @@ def run_orb() -> None:
         return
 
     # Fetch SPY trend once and share across all symbols
-    spy_bullish = get_spy_trend()
+    spy_bullish, spy_trend_pct = get_spy_trend()
 
     # -----------------------------------------------------------------------
     # STEP 1: Always manage ALL currently held positions first.
@@ -333,7 +364,7 @@ def run_orb() -> None:
     for pos in open_positions:
         held_symbols.add(pos.symbol)
         try:
-            process_symbol(pos.symbol, spy_bullish, len(open_positions), 0)
+            process_symbol(pos.symbol, spy_bullish, spy_trend_pct, len(open_positions), 0)
         except Exception as e:
             log.error(f"{pos.symbol}: unexpected error managing position — {e}")
 
@@ -352,7 +383,7 @@ def run_orb() -> None:
                 # Already managed above — don't double-process
                 continue
             try:
-                opened_new = process_symbol(symbol, spy_bullish, open_positions_count, max_open_positions)
+                opened_new = process_symbol(symbol, spy_bullish, spy_trend_pct, open_positions_count, max_open_positions)
                 if opened_new:
                     open_positions_count += 1
             except Exception as e:
@@ -361,6 +392,7 @@ def run_orb() -> None:
 
 if __name__ == "__main__":
     log.info("ORB Bot starting (Dynamic Symbols via OpenBB)")
+    log.info(f"ML scorer: {'ENABLED (threshold {ML_CONFIDENCE_THRESHOLD:.0%})' if _ML_ENABLED else 'DISABLED (model not found — running rule-based only)'}")
     log.info(f"OR: first {ORB_RANGE_BARS} bars | ${ORB_POSITION_SIZE}/trade | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
     log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | per-symbol multipliers")
     run_orb()

@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+.idea/
+backtest/data/
+ml/models/*.pkl
+scratch/
+openbb_test/

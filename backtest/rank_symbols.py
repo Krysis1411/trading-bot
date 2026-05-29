@@ -74,7 +74,7 @@ def _load_spy_bars():
         return None
 
 
-def backtest_symbol(symbol: str, spy_bars) -> dict | None:
+def backtest_symbol(symbol: str, spy_bars) -> tuple[dict, list[dict]] | None:
     try:
         instrument = TestInstrumentProvider.equity(symbol=symbol, venue="XNAS")
 
@@ -141,7 +141,11 @@ def backtest_symbol(symbol: str, spy_bars) -> dict | None:
         engine.run()
 
         positions = engine.trader.generate_positions_report()
-        account = engine.trader.generate_account_report(XNAS)
+        account   = engine.trader.generate_account_report(XNAS)
+
+        # Collect ML training data from the strategy's trade log
+        strategy_instance = engine.trader.strategies()[0]
+        trade_log = list(strategy_instance.trade_log)
 
         if positions.empty:
             result = dict(symbol=symbol, multiplier=profit_multiplier, trades=0, wins=0, losses=0,
@@ -174,7 +178,7 @@ def backtest_symbol(symbol: str, spy_bars) -> dict | None:
 
         engine.reset()
         engine.dispose()
-        return result
+        return result, trade_log
 
     except Exception as e:
         print(f"  ERROR — {e}")
@@ -194,12 +198,16 @@ def run_ranking(symbols: list[str]) -> None:
     spy_bars = _load_spy_bars()
     print("OK" if spy_bars is not None else "FAILED (trend filter disabled)")
 
-    results = []
+    results    = []
+    all_trades = []   # ML training data collected across all symbols
+
     for i, sym in enumerate(symbols, 1):
         print(f"[{i:>2}/{len(symbols)}] {sym:<6}", end="  ", flush=True)
-        result = backtest_symbol(sym, spy_bars)
-        if result:
+        ret = backtest_symbol(sym, spy_bars)
+        if ret:
+            result, trade_log = ret
             results.append(result)
+            all_trades.extend(trade_log)
             pnl_str = f"${result['total_pnl']:>+8.2f}"
             print(f"trades={result['trades']:>2}  win%={result['win_rate_pct']:>5.1f}%  "
                   f"pnl={pnl_str}  avg=${result['avg_pnl_per_trade']:>+7.2f}  "
@@ -216,6 +224,15 @@ def run_ranking(symbols: list[str]) -> None:
 
     csv_path = RESULTS_DIR / "orb_ranking.csv"
     df.to_csv(csv_path)
+
+    # Save ML training data
+    if all_trades:
+        features_df   = pd.DataFrame(all_trades)
+        features_path = RESULTS_DIR / "breakout_features.csv"
+        features_df.to_csv(features_path, index=False)
+        wins = int(features_df["hit_target"].sum()) if "hit_target" in features_df.columns else 0
+        print(f"\n  ML training data → {features_path}"
+              f"  ({len(all_trades)} trades | {wins/len(all_trades):.1%} win rate)")
 
     # Print ranked table
     w = 88

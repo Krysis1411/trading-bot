@@ -50,6 +50,8 @@ class ORBStrategy(Strategy):
     def __init__(self, config: ORBConfig) -> None:
         super().__init__(config)
         self.instrument: Instrument | None = None
+        self.trade_log: list[dict] = []        # populated during backtest
+        self._entry_features: dict | None = None
         self._reset_daily_state()
         self._current_date: date | None = None
         self._spy_open: float | None = None
@@ -68,6 +70,18 @@ class ORBStrategy(Strategy):
         self._stop_price: float | None = None
         self._target_price: float | None = None
         self._traded_today: bool = False
+
+    def _record_exit(self, price: float, reason: str) -> None:
+        """Attach outcome to the pending entry features and commit to trade_log."""
+        if self._entry_features is None:
+            return
+        self._entry_features.update({
+            "hit_target": 1 if reason == "TARGET" else 0,
+            "exit_reason": reason,
+            "exit_price": price,
+        })
+        self.trade_log.append(dict(self._entry_features))
+        self._entry_features = None
 
     def _bar_et_time(self, bar: Bar) -> tuple[date, time]:
         dt_utc = datetime.fromtimestamp(bar.ts_event / 1_000_000_000, tz=timezone.utc)
@@ -142,6 +156,7 @@ class ORBStrategy(Strategy):
         # ---- Phase 2: EOD forced close ----
         if bar_time >= self._close_time():
             if self.portfolio.is_net_long(self.config.instrument_id):
+                self._record_exit(close, "EOD")
                 self.close_all_positions(self.config.instrument_id)
                 self.log.info(f"EOD CLOSE at {close:.2f}")
                 self._traded_today = True
@@ -150,12 +165,14 @@ class ORBStrategy(Strategy):
         # ---- Phase 3: manage open position ----
         if self.portfolio.is_net_long(self.config.instrument_id):
             if close <= self._stop_price:
+                self._record_exit(close, "STOP")
                 self.close_all_positions(self.config.instrument_id)
                 self.log.info(f"STOP LOSS {close:.2f}  (stop={self._stop_price:.2f})")
                 self._traded_today = True
                 return
 
             if close >= self._target_price:
+                self._record_exit(close, "TARGET")
                 self.close_all_positions(self.config.instrument_id)
                 self.log.info(f"TAKE PROFIT {close:.2f}  (target={self._target_price:.2f})")
                 self._traded_today = True
@@ -182,6 +199,25 @@ class ORBStrategy(Strategy):
             self._stop_price = self._or_low - self.config.stop_buffer
             self._target_price = self._or_high + or_range * self.config.profit_multiplier
 
+            # Capture entry features for ML training
+            spy_trend = (
+                (self._spy_last - self._spy_open) / self._spy_open
+                if (self._spy_open and self._spy_last and self._spy_open > 0)
+                else 0.0
+            )
+            self._entry_features = {
+                "symbol":             str(self.config.instrument_id.symbol),
+                "date":               bar_date.isoformat(),
+                "entry_time":         bar_time.strftime("%H:%M"),
+                "or_range_pct":       or_range / self._or_high,
+                "volume_ratio":       volume / max(avg_or_vol, 1.0),
+                "breakout_pct":       (close - self._or_high) / self._or_high,
+                "minutes_after_open": (bar_time.hour - 10) * 60 + bar_time.minute,
+                "spy_trend_pct":      spy_trend,
+                "day_of_week":        float(bar_date.weekday()),
+                "entry_price":        close,
+            }
+
             order = self.order_factory.market(
                 instrument_id=self.config.instrument_id,
                 order_side=OrderSide.BUY,
@@ -199,6 +235,8 @@ class ORBStrategy(Strategy):
 
     def on_stop(self) -> None:
         self.cancel_all_orders(self.config.instrument_id)
+        if self.portfolio.is_net_long(self.config.instrument_id):
+            self._record_exit(0.0, "ENGINE_STOP")
         self.close_all_positions(self.config.instrument_id)
         self.unsubscribe_bars(self.config.bar_type)
         if self.config.spy_bar_type is not None:
@@ -207,6 +245,7 @@ class ORBStrategy(Strategy):
     def on_reset(self) -> None:
         self._reset_daily_state()
         self._current_date = None
+        self._entry_features = None   # clear pending entry; trade_log is kept
         self._spy_open = None
         self._spy_last = None
         self._spy_date = None

@@ -1,0 +1,12 @@
+Holdout ROC-AUC  : 0.455
+Holdout samples  : 45
+Confidence gate  : 58%
+
+              precision    recall  f1-score   support
+
+        miss       0.36      0.28      0.31        18
+         hit       0.58      0.67      0.62        27
+
+    accuracy                           0.51        45
+   macro avg       0.47      0.47      0.47        45
+weighted avg       0.49      0.51      0.50        45
