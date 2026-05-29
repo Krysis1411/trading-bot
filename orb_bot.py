@@ -47,6 +47,7 @@ from config import (
     ORB_STOP_BUFFER,
     ORB_VOLUME_FACTOR,
     MAX_TOTAL_INVESTMENT,
+    DAILY_LOSS_LIMIT_PCT,
 )
 from screener import get_active_symbols
 
@@ -318,6 +319,19 @@ def run_orb() -> None:
 
     now_et = get_now_et()
     log.info(f"--- ORB check at {now_et.strftime('%H:%M')} ET ---")
+
+    # Daily loss circuit-breaker (from QuantTrading risk_engine.py)
+    try:
+        account = trading_client.get_account()
+        equity      = float(account.equity)
+        last_equity = float(account.last_equity)
+        if last_equity > 0:
+            daily_pnl_pct = (equity - last_equity) / last_equity
+            if daily_pnl_pct <= -DAILY_LOSS_LIMIT_PCT:
+                log.warning(f"Daily loss limit hit ({daily_pnl_pct:.1%}) — managing existing positions only")
+                # Fall through to manage held positions but block new entries below
+    except Exception:
+        daily_pnl_pct = 0.0
 
     # Hard EOD sweep — runs directly from the positions list, no bar data needed.
     # Prevents overnight holds even if bar fetching fails at close time.

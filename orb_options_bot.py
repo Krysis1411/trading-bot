@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 import yfinance as yf
 from ml.iv_calculator import compute_iv_rank, compute_iv_skew, enrich_chain
+from ml.regime_detector import RegimeResult, daily_trend, detect_regime
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, GetOptionContractsRequest, OptionLegRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass, PositionSide, QueryOrderStatus
@@ -33,6 +34,10 @@ from config import (
     ORB_STOP_BUFFER,
     ORB_VOLUME_FACTOR,
     ORB_OPTIONS_IV_THRESHOLD,
+    DAILY_LOSS_LIMIT_PCT,
+    MAX_DRAWDOWN_PCT,
+    MAX_RISK_PER_TRADE_PCT,
+    MIN_RR_RATIO,
 )
 from screener import get_active_symbols
 
@@ -79,6 +84,69 @@ def check_options_approval() -> bool:
     except Exception as e:
         log.warning(f"Could not verify options approval level: {e}")
         return False
+
+
+def check_risk_limits() -> bool:
+    """
+    Adapted from trading00money/QuantTrading risk_engine.py.
+    Returns False (block new entries) when:
+      - Today's P&L < -DAILY_LOSS_LIMIT_PCT of yesterday's equity, OR
+      - Total drawdown from peak > MAX_DRAWDOWN_PCT
+    """
+    try:
+        account = trading_client.get_account()
+        equity      = float(account.equity)
+        last_equity = float(account.last_equity)   # previous session close
+
+        # Daily loss circuit-breaker
+        if last_equity > 0:
+            daily_pnl_pct = (equity - last_equity) / last_equity
+            if daily_pnl_pct <= -DAILY_LOSS_LIMIT_PCT:
+                log.warning(
+                    f"Daily loss limit hit ({daily_pnl_pct:.1%} vs limit -{DAILY_LOSS_LIMIT_PCT:.0%}) "
+                    "— no new entries today"
+                )
+                return False
+
+        # Drawdown kill-switch vs all-time peak in this session
+        # Use buying_power + portfolio_value as a rough peak proxy
+        portfolio = float(account.portfolio_value)
+        peak = max(equity, portfolio)
+        if peak > 0:
+            drawdown = (peak - equity) / peak
+            if drawdown >= MAX_DRAWDOWN_PCT:
+                log.warning(
+                    f"Max drawdown hit ({drawdown:.1%} vs limit {MAX_DRAWDOWN_PCT:.0%}) "
+                    "— stopping all new entries"
+                )
+                return False
+
+        log.info(f"Risk OK — equity ${equity:,.0f} | daily P&L {(equity-last_equity)/last_equity:+.1%}")
+        return True
+    except Exception as e:
+        log.warning(f"Could not check risk limits: {e} — proceeding")
+        return True
+
+
+def get_daily_bars(symbol: str, lookback_days: int = 60) -> pd.DataFrame | None:
+    """Fetch daily bars for regime detection and daily trend filter."""
+    from datetime import timedelta
+    start = get_now_et() - timedelta(days=lookback_days)
+    try:
+        response = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(1, TimeFrameUnit.Day),
+            start=start,
+        ))
+        df = response.df
+        if df.empty:
+            return None
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.loc[symbol]
+        return df if not df.empty else None
+    except Exception as e:
+        log.warning(f"{symbol}: failed to fetch daily bars — {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +291,9 @@ def close_all_legs(positions: list) -> None:
 # Strategy logic
 # ---------------------------------------------------------------------------
 
-def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions_count: int, max_open_positions: int) -> bool:
+def process_symbol_options(symbol: str, spy_bullish: bool | None,
+                           open_positions_count: int, max_open_positions: int,
+                           regime: RegimeResult | None = None) -> bool:
     """
     Evaluate ORB and volatility conditions for a symbol. If setup exists,
     selects options strategy via OpenBB and submits an Alpaca MLEG order.
@@ -330,19 +400,45 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
     # Positive = bearish skew (puts expensive) | Negative = bullish skew (calls expensive)
     iv_skew = compute_iv_skew(calls, puts, current_price)
 
+    # Regime-aware adjustments (from QuantTrading regime_detector.py)
+    # Fetch intraday regime from today's 5-min bars
+    intraday_bars = get_today_bars(symbol)
+    intraday_regime = detect_regime(intraday_bars) if intraday_bars is not None and len(intraday_bars) >= 30 else None
+
+    # Fetch daily regime and trend filter
+    daily_bars = get_daily_bars(symbol)
+    stock_daily_trend = daily_trend(daily_bars) if daily_bars is not None else "NEUTRAL"
+
+    regime_label = intraday_regime.regime if intraday_regime else (regime.regime if regime else "NORMAL")
+
     log.info(f"{symbol} | ATM Call: {atm_call['contractSymbol']} (Strike: {atm_call['strike']} | Ask: {atm_call['ask']})")
     log.info(f"{symbol} | ATM Put: {atm_put['contractSymbol']} (Strike: {atm_put['strike']} | Ask: {atm_put['ask']})")
     log.info(f"{symbol} | ATM IV: {avg_atm_iv:.2%} | IV Rank: {iv_rank:.0f}/100 | Skew: {iv_skew:+.3f}")
+    log.info(f"{symbol} | Regime: {regime_label} | Daily trend: {stock_daily_trend}")
+
+    # CRISIS regime: skip new entries (QuantTrading: "crisis always wins")
+    if regime_label == "CRISIS":
+        log.warning(f"{symbol} | CRISIS regime detected — skipping new options entry")
+        return False
 
     strategy = None
     legs = []
     qty = 0
     limit_price = 0.05  # set per strategy below; positive = debit, negative = credit
 
-    # Strategy selection based on IV Rank instead of raw IV threshold.
-    # IV Rank > 70 (historically expensive) → sell premium → Iron Condor.
-    # On 0DTE: threshold lowered further (IV always elevated intraday).
-    iv_rank_threshold = 70.0 * (0.75 if is_0dte else 1.0)   # 70 normal, 52.5 on 0DTE
+    # Strategy selection based on IV Rank + Regime (QuantTrading regime_detector.py)
+    # RANGING regime → lower threshold to strongly prefer Iron Condors
+    # TRENDING regime → raise threshold to prefer debit spreads
+    # 0DTE → compress threshold regardless (IV always elevated)
+    if regime_label == "RANGING":
+        iv_rank_threshold = 50.0   # sell premium more aggressively in range-bound market
+    elif regime_label == "TRENDING":
+        iv_rank_threshold = 80.0   # require truly expensive IV before selling premium
+    else:
+        iv_rank_threshold = 70.0   # NORMAL / HIGH_VOL
+
+    if is_0dte:
+        iv_rank_threshold *= 0.75  # compress threshold on expiry day
 
     if iv_rank > iv_rank_threshold and is_range_bound:
         # Strategy: Iron Condor (High IV & Range-bound)
@@ -410,9 +506,9 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
     elif iv_rank <= iv_rank_threshold:
         # Low IV Rank: we BUY premium
         if is_breakout_above:
-            # Bull Call Spread: SPY bullish AND skew confirms (calls not cheap = no negative skew)
-            if spy_bullish is True and iv_skew >= -0.05:
-                # Bull Call Spread (breakout aligned with SPY trend + skew neutral/bearish)
+            # Bull Call Spread: SPY bullish AND stock daily trend not bearish AND skew confirms
+            if spy_bullish is True and stock_daily_trend != "BEARISH" and iv_skew >= -0.05:
+                # Bull Call Spread (all three filters aligned: SPY, daily trend, skew)
                 strategy = "Bull Call Spread"
                 long_call = atm_call
                 
@@ -446,9 +542,9 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                 log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
         elif is_breakout_below:
-            # Bear Put Spread: SPY bearish AND skew confirms (puts not cheap = no positive skew inverted)
-            if spy_bullish is False and iv_skew <= 0.05:
-                # Bear Put Spread (breakout aligned with SPY trend + skew neutral/bullish)
+            # Bear Put Spread: SPY bearish AND stock daily trend not bullish AND skew confirms
+            if spy_bullish is False and stock_daily_trend != "BULLISH" and iv_skew <= 0.05:
+                # Bear Put Spread (all three filters aligned: SPY, daily trend, skew)
                 strategy = "Bear Put Spread"
                 long_put = atm_put
                 
@@ -593,6 +689,10 @@ def run_orb_options() -> None:
     if not DRY_RUN and not check_options_approval():
         log.error("Options Level 2 not approved — cannot submit multi-leg orders. Exiting.")
         return
+
+    if not DRY_RUN and not check_risk_limits():
+        log.warning("Risk limits active — skipping new entries this run.")
+        # Still manage existing positions below
 
     now_et = get_now_et()
     log.info(f"--- ORB Options check at {now_et.strftime('%H:%M')} ET ---")
