@@ -13,6 +13,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 import yfinance as yf
+from ml.iv_calculator import compute_iv_rank, compute_iv_skew, enrich_chain
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, GetOptionContractsRequest, OptionLegRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass, PositionSide, QueryOrderStatus
@@ -306,28 +307,44 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
         log.warning(f"{symbol} | Missing Call or Put contracts for expiry {nearest_expiry}")
         return False
 
+    # Enrich chain with Newton-Raphson IV (more accurate than yfinance's stale column)
+    T_years = (date.fromisoformat(nearest_expiry) - date.today()).days / 365.0
+    T_years = max(T_years, 1 / (252 * 6.5))   # floor at one 5-min bar
+    calls, puts = enrich_chain(calls, puts, current_price, T_years)
+
     # Sort strikes by closeness to current price to find ATM contracts
     calls_sorted = calls.iloc[(calls['strike'] - current_price).abs().argsort()]
-    puts_sorted = puts.iloc[(puts['strike'] - current_price).abs().argsort()]
+    puts_sorted  = puts.iloc[(puts['strike']  - current_price).abs().argsort()]
 
     atm_call = calls_sorted.iloc[0]
-    atm_put = puts_sorted.iloc[0]
+    atm_put  = puts_sorted.iloc[0]
 
-    avg_atm_iv = (float(atm_call['impliedVolatility']) + float(atm_put['impliedVolatility'])) / 2
+    # Use NR-computed IV; fall back to yfinance if NR column missing
+    avg_atm_iv = (float(atm_call.get('nr_iv', atm_call['impliedVolatility'])) +
+                  float(atm_put.get('nr_iv',  atm_put['impliedVolatility']))) / 2
+
+    # IV Rank (0–100): where current IV sits in the symbol's 1-year range
+    iv_rank = compute_iv_rank(symbol, avg_atm_iv)
+
+    # IV Skew: OTM put IV - OTM call IV
+    # Positive = bearish skew (puts expensive) | Negative = bullish skew (calls expensive)
+    iv_skew = compute_iv_skew(calls, puts, current_price)
+
     log.info(f"{symbol} | ATM Call: {atm_call['contractSymbol']} (Strike: {atm_call['strike']} | Ask: {atm_call['ask']})")
     log.info(f"{symbol} | ATM Put: {atm_put['contractSymbol']} (Strike: {atm_put['strike']} | Ask: {atm_put['ask']})")
-    log.info(f"{symbol} | Average ATM IV: {avg_atm_iv:.2%}")
+    log.info(f"{symbol} | ATM IV: {avg_atm_iv:.2%} | IV Rank: {iv_rank:.0f}/100 | Skew: {iv_skew:+.3f}")
 
     strategy = None
     legs = []
     qty = 0
     limit_price = 0.05  # set per strategy below; positive = debit, negative = credit
 
-    # On 0DTE, IV is structurally elevated and collapses to zero by close.
-    # Lower the threshold so range-bound plays are always treated as IC.
-    iv_threshold = ORB_OPTIONS_IV_THRESHOLD * (0.75 if is_0dte else 1.0)
+    # Strategy selection based on IV Rank instead of raw IV threshold.
+    # IV Rank > 70 (historically expensive) → sell premium → Iron Condor.
+    # On 0DTE: threshold lowered further (IV always elevated intraday).
+    iv_rank_threshold = 70.0 * (0.75 if is_0dte else 1.0)   # 70 normal, 52.5 on 0DTE
 
-    if avg_atm_iv > iv_threshold and is_range_bound:
+    if iv_rank > iv_rank_threshold and is_range_bound:
         # Strategy: Iron Condor (High IV & Range-bound)
         strategy = "Iron Condor"
         
@@ -390,11 +407,12 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
         limit_price = -round(net_credit, 2)  # negative = credit received
         log.info(f"{symbol} | Iron Condor | Credit: ${net_credit:.2f} | Risk: ${risk:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
-    elif avg_atm_iv <= iv_threshold:
-        # Low IV: we BUY premium
+    elif iv_rank <= iv_rank_threshold:
+        # Low IV Rank: we BUY premium
         if is_breakout_above:
-            if spy_bullish is True:
-                # Bull Call Spread (breakout aligned with SPY trend)
+            # Bull Call Spread: SPY bullish AND skew confirms (calls not cheap = no negative skew)
+            if spy_bullish is True and iv_skew >= -0.05:
+                # Bull Call Spread (breakout aligned with SPY trend + skew neutral/bearish)
                 strategy = "Bull Call Spread"
                 long_call = atm_call
                 
@@ -428,8 +446,9 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                 log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
         elif is_breakout_below:
-            if spy_bullish is False:
-                # Bear Put Spread (breakout aligned with SPY trend)
+            # Bear Put Spread: SPY bearish AND skew confirms (puts not cheap = no positive skew inverted)
+            if spy_bullish is False and iv_skew <= 0.05:
+                # Bear Put Spread (breakout aligned with SPY trend + skew neutral/bullish)
                 strategy = "Bear Put Spread"
                 long_put = atm_put
                 
@@ -463,7 +482,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None, open_positions
                 log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
 
     if strategy is None:
-        log.info(f"{symbol} | No options setup matched the criteria (IV: {avg_atm_iv:.2%})")
+        log.info(f"{symbol} | No options setup matched the criteria "
+                 f"(IV: {avg_atm_iv:.2%} | IV Rank: {iv_rank:.0f} | Skew: {iv_skew:+.3f})")
         return False
 
     # Place MLEG order
