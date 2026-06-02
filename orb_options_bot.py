@@ -6,7 +6,7 @@ and dynamically submits multi-leg defined-risk orders (Spreads, Straddles, Iron 
 import logging
 import os
 import re
-from datetime import datetime, time, date, timezone
+from datetime import datetime, time, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -16,7 +16,7 @@ import yfinance as yf
 from ml.iv_calculator import compute_iv_rank, compute_iv_skew, enrich_chain
 from ml.regime_detector import RegimeResult, daily_trend, detect_regime
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, GetOptionContractsRequest, OptionLegRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, OptionLegRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent, AssetClass, PositionSide, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -33,11 +33,8 @@ from config import (
     ORB_RANGE_BARS,
     ORB_STOP_BUFFER,
     ORB_VOLUME_FACTOR,
-    ORB_OPTIONS_IV_THRESHOLD,
     DAILY_LOSS_LIMIT_PCT,
     MAX_DRAWDOWN_PCT,
-    MAX_RISK_PER_TRADE_PCT,
-    MIN_RR_RATIO,
 )
 from screener import get_active_symbols
 
@@ -130,7 +127,6 @@ def check_risk_limits() -> bool:
 
 def get_daily_bars(symbol: str, lookback_days: int = 60) -> pd.DataFrame | None:
     """Fetch daily bars for regime detection and daily trend filter."""
-    from datetime import timedelta
     start = get_now_et() - timedelta(days=lookback_days)
     try:
         response = data_client.get_stock_bars(StockBarsRequest(
@@ -370,8 +366,7 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
         return False
 
     if is_0dte:
-        log.info(f"{symbol} | 0DTE — expiry today ({nearest_expiry}). "
-                 "Lowering IV threshold to aggressively favour Iron Condors (rapid theta decay).")
+        log.info(f"{symbol} | 0DTE detected (expiry today: {nearest_expiry})")
 
     if calls.empty or puts.empty:
         log.warning(f"{symbol} | Missing Call or Put contracts for expiry {nearest_expiry}")
@@ -438,7 +433,8 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
         iv_rank_threshold = 70.0   # NORMAL / HIGH_VOL
 
     if is_0dte:
-        iv_rank_threshold *= 0.75  # compress threshold on expiry day
+        iv_rank_threshold *= 0.75   # 0DTE: IV always elevated, compress threshold
+        log.info(f"{symbol} | 0DTE IV rank threshold → {iv_rank_threshold:.1f} (prefer Iron Condors)")
 
     if iv_rank > iv_rank_threshold and is_range_bound:
         # Strategy: Iron Condor (High IV & Range-bound)
@@ -744,9 +740,7 @@ def run_orb_options() -> None:
         log.error("Options Level 2 not approved — cannot submit multi-leg orders. Exiting.")
         return
 
-    if not DRY_RUN and not check_risk_limits():
-        log.warning("Risk limits active — skipping new entries this run.")
-        # Still manage existing positions below
+    _block_new_entries = not DRY_RUN and not check_risk_limits()
 
     now_et = get_now_et()
     log.info(f"--- ORB Options check at {now_et.strftime('%H:%M')} ET ---")
@@ -806,6 +800,10 @@ def run_orb_options() -> None:
     max_open_positions = max(1, int(MAX_OPTIONS_INVESTMENT / ORB_OPTIONS_POSITION_SIZE))
 
     # 2. Screen for new options entry opportunities
+    if _block_new_entries:
+        log.warning("Risk limits active — skipping new entries, existing positions still managed")
+        return
+
     active_symbols = get_active_symbols()
     if not active_symbols:
         log.warning("No active symbols found from screener. Skipping new entries.")

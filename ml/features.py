@@ -30,6 +30,7 @@ def compute_features(
     bar_et: datetime,
     spy_open: float | None = None,
     spy_last: float | None = None,
+    spy_trend_pct: float | None = None,
 ) -> list[float]:
     """
     Compute the feature vector for a single breakout entry.
@@ -42,15 +43,18 @@ def compute_features(
     volume              : volume of the breakout bar
     avg_or_volume       : mean volume of the OR bars
     bar_et              : bar timestamp in US/Eastern timezone
-    spy_open, spy_last  : SPY session open and most-recent close (optional)
+    spy_open, spy_last  : SPY session open and most-recent close (computed if provided)
+    spy_trend_pct       : pre-computed SPY trend pct (overrides spy_open/spy_last)
     """
     or_range = or_high - or_low
-    spy_trend = (
-        (spy_last - spy_open) / spy_open
-        if (spy_open and spy_last and spy_open > 0)
-        else 0.0
-    )
-    # minutes elapsed since 10:00 AM ET (when the OR window closes)
+
+    if spy_trend_pct is not None:
+        spy_trend = spy_trend_pct
+    elif spy_open and spy_last and spy_open > 0:
+        spy_trend = (spy_last - spy_open) / spy_open
+    else:
+        spy_trend = 0.0
+
     minutes_after_open = (bar_et.hour - 10) * 60 + bar_et.minute
 
     return [

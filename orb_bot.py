@@ -277,10 +277,8 @@ def process_symbol(symbol: str, spy_bullish: bool | None, spy_trend_pct: float,
                 breakout_price=current_price,
                 volume=current_volume, avg_or_volume=avg_or_volume,
                 bar_et=now_et,
-                spy_open=None, spy_last=None,   # pass raw trend pct instead
+                spy_trend_pct=spy_trend_pct,
             )
-            # Override spy_trend_pct with the value fetched once in run_orb()
-            feats[4] = spy_trend_pct
             confidence = _SCORER.predict_proba([feats])[0][1]
             log.info(f"{symbol} | ML confidence: {confidence:.0%}")
             if confidence < ML_CONFIDENCE_THRESHOLD:
@@ -321,6 +319,8 @@ def run_orb() -> None:
     log.info(f"--- ORB check at {now_et.strftime('%H:%M')} ET ---")
 
     # Daily loss circuit-breaker (from QuantTrading risk_engine.py)
+    # Blocks new entries; existing positions are still managed below.
+    _block_new_entries = False
     try:
         account = trading_client.get_account()
         equity      = float(account.equity)
@@ -328,10 +328,10 @@ def run_orb() -> None:
         if last_equity > 0:
             daily_pnl_pct = (equity - last_equity) / last_equity
             if daily_pnl_pct <= -DAILY_LOSS_LIMIT_PCT:
-                log.warning(f"Daily loss limit hit ({daily_pnl_pct:.1%}) — managing existing positions only")
-                # Fall through to manage held positions but block new entries below
+                log.warning(f"Daily loss limit hit ({daily_pnl_pct:.1%}) — managing existing positions only, no new entries")
+                _block_new_entries = True
     except Exception:
-        daily_pnl_pct = 0.0
+        pass
 
     # Hard EOD sweep — runs directly from the positions list, no bar data needed.
     # Prevents overnight holds even if bar fetching fails at close time.
@@ -388,6 +388,10 @@ def run_orb() -> None:
     # -----------------------------------------------------------------------
     # STEP 2: Screen for new entry opportunities (skip already-held symbols).
     # -----------------------------------------------------------------------
+    if _block_new_entries:
+        log.info("Skipping new entries — daily loss limit active")
+        return
+
     active_symbols = get_active_symbols()
     if not active_symbols:
         log.warning("No active symbols found from screener. Skipping new entries.")
