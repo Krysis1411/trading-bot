@@ -608,32 +608,65 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
         return False
 
 
+def _parse_strike(option_symbol: str) -> float:
+    """Extract strike price from OCC symbol e.g. INTC260605C00111000 → 111.0"""
+    match = re.search(r"\d{6}[CP](\d{8})", option_symbol)
+    return int(match.group(1)) / 1000.0 if match else 0.0
+
+
+def _get_short_strikes(positions: list) -> tuple[float | None, float | None]:
+    """
+    Return (short_call_strike, short_put_strike) by parsing OCC symbols.
+    Used by manage_existing_options_positions to set the correct stop levels
+    for Iron Condors regardless of which day they were entered.
+    """
+    short_call = None
+    short_put  = None
+    for pos in positions:
+        sym = pos.symbol
+        match = re.search(r"\d{6}([CP])\d{8}", sym)
+        if not match:
+            continue
+        opt_type = match.group(1)
+        is_short = float(pos.qty) < 0
+        strike   = _parse_strike(sym)
+        if is_short and opt_type == "C":
+            short_call = strike
+        elif is_short and opt_type == "P":
+            short_put = strike
+    return short_call, short_put
+
+
 def manage_existing_options_positions(underlying_symbol: str, positions: list, spy_bullish: bool | None) -> None:
     """Monitor underlying stock price levels to exit options strategies dynamically."""
     strategy = classify_holding(positions)
-    
+
     bars = get_today_bars(underlying_symbol)
     if bars is None:
         return
-    or_result = compute_opening_range(bars)
-    if or_result is None:
-        return
-    or_high, or_low, _ = or_result
-    or_range = or_high - or_low
-    
+
     current_price = float(bars.iloc[-1]["close"])
     now_et = get_now_et()
-    
+
     # Forced close at EOD
     if now_et.time() >= CLOSE_TIME:
         log.info(f"EOD CLOSE — closing all options legs for {underlying_symbol}")
         close_all_legs(positions)
         return
-        
+
+    # OR levels needed only for debit-spread and straddle stops/targets
+    or_result = compute_opening_range(bars)
+    or_high = or_low = or_range = None
+    if or_result is not None:
+        or_high, or_low, _ = or_result
+        or_range = or_high - or_low
+
     profit_multiplier = ORB_PROFIT_MULTIPLIERS.get(underlying_symbol, ORB_PROFIT_MULTIPLIER)
-    
+
     if strategy == "call_spread":
-        stop_price = or_low - ORB_STOP_BUFFER
+        if or_high is None:
+            return
+        stop_price   = or_low - ORB_STOP_BUFFER
         target_price = or_high + or_range * profit_multiplier
         if current_price <= stop_price:
             log.info(f"STOP LOSS — Closing Call Spread for {underlying_symbol} (price {current_price:.2f} <= {stop_price:.2f})")
@@ -641,9 +674,11 @@ def manage_existing_options_positions(underlying_symbol: str, positions: list, s
         elif current_price >= target_price:
             log.info(f"TAKE PROFIT — Closing Call Spread for {underlying_symbol} (price {current_price:.2f} >= {target_price:.2f})")
             close_all_legs(positions)
-            
+
     elif strategy == "put_spread":
-        stop_price = or_high + ORB_STOP_BUFFER
+        if or_high is None:
+            return
+        stop_price   = or_high + ORB_STOP_BUFFER
         target_price = or_low - or_range * profit_multiplier
         if current_price >= stop_price:
             log.info(f"STOP LOSS — Closing Put Spread for {underlying_symbol} (price {current_price:.2f} >= {stop_price:.2f})")
@@ -651,30 +686,49 @@ def manage_existing_options_positions(underlying_symbol: str, positions: list, s
         elif current_price <= target_price:
             log.info(f"TAKE PROFIT — Closing Put Spread for {underlying_symbol} (price {current_price:.2f} <= {target_price:.2f})")
             close_all_legs(positions)
-            
+
     elif strategy == "straddle":
+        if or_high is None:
+            return
         target_high = or_high + or_range * profit_multiplier
-        target_low = or_low - or_range * profit_multiplier
-        # Stop loss if total P&L is down -50%
+        target_low  = or_low  - or_range * profit_multiplier
         try:
             total_pnl_pct = sum(float(pos.unrealized_plpc) for pos in positions) * 100
         except Exception:
             total_pnl_pct = 0.0
-            
         if current_price >= target_high or current_price <= target_low:
             log.info(f"TAKE PROFIT — Closing Straddle for {underlying_symbol} (price {current_price:.2f})")
             close_all_legs(positions)
         elif total_pnl_pct <= -50.0:
             log.info(f"STOP LOSS — Closing Straddle for {underlying_symbol} (P&L: {total_pnl_pct:.2f}%)")
             close_all_legs(positions)
-            
+
     elif strategy == "iron_condor":
-        # Stop loss if the stock breaches the short strikes (or_low / or_high)
-        if current_price >= or_high or current_price <= or_low:
-            log.info(f"STOP LOSS — Closing Iron Condor for {underlying_symbol} (price {current_price:.2f} breached {or_low:.2f}-{or_high:.2f})")
-            close_all_legs(positions)
+        # Stop at the SHORT STRIKES — parsed directly from the OCC contract symbols.
+        # Previously this used today's OR high/low which is wrong for multi-day condors.
+        sc_strike, sp_strike = _get_short_strikes(positions)
+
+        if sc_strike and sp_strike:
+            log.info(
+                f"{underlying_symbol} | Iron Condor stops: put ${sp_strike:.2f} / call ${sc_strike:.2f}"
+                f" | Current: ${current_price:.2f}"
+            )
+            if current_price >= sc_strike:
+                log.info(f"STOP LOSS — Closing Iron Condor for {underlying_symbol} "
+                         f"(price {current_price:.2f} >= short call {sc_strike:.2f})")
+                close_all_legs(positions)
+            elif current_price <= sp_strike:
+                log.info(f"STOP LOSS — Closing Iron Condor for {underlying_symbol} "
+                         f"(price {current_price:.2f} <= short put {sp_strike:.2f})")
+                close_all_legs(positions)
+            else:
+                log.info(f"{underlying_symbol} | Iron Condor holding "
+                         f"(${current_price:.2f} inside ${sp_strike:.2f}–${sc_strike:.2f})")
         else:
-            log.info(f"{underlying_symbol} | Iron Condor holding inside range (Price: {current_price:.2f} vs {or_low:.2f}-{or_high:.2f})")
+            # Fallback: can't parse strikes — use OR if available
+            if or_high and (current_price >= or_high or current_price <= or_low):
+                log.info(f"STOP LOSS (fallback) — Closing Iron Condor for {underlying_symbol}")
+                close_all_legs(positions)
 
 
 # ---------------------------------------------------------------------------
