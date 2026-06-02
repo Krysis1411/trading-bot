@@ -836,6 +836,6 @@ if __name__ == "__main__":
 
     log.info("ORB Options Bot starting (Dynamic Symbols via OpenBB)")
     log.info(f"OR: first {ORB_RANGE_BARS} bars | ${ORB_OPTIONS_POSITION_SIZE}/trade | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
-    log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | IV boundary {ORB_OPTIONS_IV_THRESHOLD:.0%}")
+    log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | IV Rank thresholds: RANGING=50 NORMAL=70 TRENDING=80 | daily loss limit {DAILY_LOSS_LIMIT_PCT:.0%}")
     run_orb_options()
     log.info("Run complete")
