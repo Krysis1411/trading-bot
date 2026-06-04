@@ -264,19 +264,38 @@ def classify_holding(positions: list) -> str:
 
 
 def close_all_legs(positions: list) -> None:
-    """Submit market orders to close all positions in the list."""
-    for pos in positions:
+    """
+    Close all legs with two fixes:
+    1. Long legs (sell-to-close) before short legs (buy-to-close).
+       Prevents Alpaca's 'uncovered option' rejection that fires when the
+       short protective leg is bought back first, leaving the long exposed.
+    2. Near-worthless options ($0.05 or less) use a $0.01 limit order
+       instead of market, avoiding the 'no available quote' rejection.
+    """
+    # Sort: long positions first (0), then short positions (1)
+    ordered = sorted(positions, key=lambda p: 0 if float(p.qty) > 0 else 1)
+
+    for pos in ordered:
         if DRY_RUN:
             log.info(f"[DRY RUN] Would close {pos.symbol} (Qty: {pos.qty})")
             continue
         try:
+            qty       = abs(int(float(pos.qty)))
             close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
-            req = MarketOrderRequest(
-                symbol=pos.symbol,
-                qty=abs(int(float(pos.qty))),
-                side=close_side,
-                time_in_force=TimeInForce.DAY,
-            )
+            price     = float(pos.current_price) if hasattr(pos, "current_price") else 1.0
+
+            if price <= 0.05:
+                # No market bid — use a $0.01 limit so the order is accepted
+                req = LimitOrderRequest(
+                    symbol=pos.symbol, qty=qty,
+                    side=close_side, time_in_force=TimeInForce.DAY,
+                    limit_price=0.01,
+                )
+            else:
+                req = MarketOrderRequest(
+                    symbol=pos.symbol, qty=qty,
+                    side=close_side, time_in_force=TimeInForce.DAY,
+                )
             trading_client.submit_order(req)
             log.info(f"Closed leg {pos.symbol} (Qty: {pos.qty})")
         except Exception as e:
@@ -794,9 +813,16 @@ def run_orb_options() -> None:
         except Exception as e:
             log.error(f"{underlying}: unexpected error managing options positions — {e}")
 
-    # Set up budgets
-    # Number of active options strategies (grouped by underlying symbol)
-    open_positions_count = len(held_symbols)
+    # Re-fetch positions after management so stops that fired this run
+    # don't inflate the budget count and block all new entries.
+    try:
+        refreshed = trading_client.get_all_positions()
+        refreshed_opts = [p for p in refreshed if p.asset_class == AssetClass.US_OPTION]
+        open_positions_count = len({get_underlying_symbol(p.symbol) for p in refreshed_opts})
+        log.info(f"Budget: {open_positions_count} open positions after management")
+    except Exception:
+        open_positions_count = len(held_symbols)   # fall back to pre-management count
+
     max_open_positions = max(1, int(MAX_OPTIONS_INVESTMENT / ORB_OPTIONS_POSITION_SIZE))
 
     # 2. Screen for new options entry opportunities
