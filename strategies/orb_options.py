@@ -1,29 +1,47 @@
 """
 ORB Options Strategy — NautilusTrader backtesting implementation.
 
-Replays equity 5-min bars through the same ORB signal logic as ORBStrategy,
-but simulates options P&L instead of submitting equity orders.
+Replays equity 5-min bars through the same ORB signal logic as the live bot
+(orb_options_bot.py) and simulates options P&L using Black-Scholes with
+realized historical volatility (20-bar annualised HV) as the IV proxy.
 
 Pricing
 -------
-Options are priced at entry and exit using Black-Scholes with realized
-historical volatility (20-bar annualized HV) as the IV proxy.
+Options are priced at entry and exit using Black-Scholes with realised
+historical volatility (20-bar annualised HV) as the IV proxy.
 
 Strategy selection (mirrors orb_options_bot.py)
 -----------------------------------------------
-  High IV + range-bound          → Iron Condor
-  Low IV + breakout up + SPY up  → Bull Call Spread
-  Low IV + breakout up + SPY ??  → Straddle
-  Low IV + breakout dn + SPY dn  → Bear Put Spread
-  Low IV + breakout dn + SPY ??  → Straddle
+  IV rank > threshold + range-bound         → Iron Condor
+  IV rank ≤ threshold + breakout up + SPY ↑ → Bull Call Spread
+  IV rank ≤ threshold + breakout up + SPY ? → Straddle
+  IV rank ≤ threshold + breakout dn + SPY ↓ → Bear Put Spread
+  IV rank ≤ threshold + breakout dn + SPY ? → Straddle
 
-P&L convention
---------------
-  entry_cost  : net cash paid at open  (positive = debit,  negative = credit)
-  exit_value  : net cash received at close
-  pnl         : exit_value - entry_cost  (positive = profit)
+Quality filters (must all pass before entry)
+--------------------------------------------
+  MIN_UNDERLYING_PRICE   — skip illiquid options chains
+  SKIP_MONDAY_ENTRIES    — Mondays have 8.7% win rate on IC symbols
+  IC_MAX_ENTRY_HOUR/MIN  — entries after 12:30 PM have 7.5% win rate
+  MIN_BREAKOUT_STRENGTH_PCT — directional only; weak breakouts fail
+  IC_SIGMA_MULTIPLE      — short strikes ≥ 1.5× expected move
+  IC_MIN_CREDIT_RATIO    — credit ≥ 20% of spread width
+
+Management exits
+----------------
+  IC profit target  — close when unrealised P&L ≥ IC_PROFIT_TARGET_PCT × credit
+  IC P&L stop       — close when loss ≥ IC_PNL_STOP_MULTIPLE × credit
+  Price-based stop  — close when price touches a short strike
+  EOD               — force-close at close_hour:close_minute
+
+SYNC NOTE
+---------
+After any change to orb_options_bot.py or config.py run:
+    python check_backtest_parity.py
+and update this file if it reports drift.
 """
 import math
+from collections import deque
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
@@ -32,10 +50,29 @@ from nautilus_trader.model.data import Bar, BarType
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
+from config import (
+    IC_MAX_ENTRY_HOUR,
+    IC_MAX_ENTRY_MINUTE,
+    IC_MIN_CREDIT_RATIO,
+    IC_PNL_STOP_MULTIPLE,
+    IC_PROFIT_TARGET_PCT,
+    IC_SIGMA_MULTIPLE,
+    MIN_BREAKOUT_STRENGTH_PCT,
+    MIN_UNDERLYING_PRICE,
+    SKIP_MONDAY_ENTRIES,
+)
+
 ET = ZoneInfo("America/New_York")
-_RISK_FREE = 0.05          # annualized risk-free rate
+_RISK_FREE = 0.05
 _BARS_PER_DAY = 78         # 5-min bars in a regular session
 _TRADING_DAYS = 252
+
+# IV rank threshold — mirrors live bot: NORMAL regime (70.0) × 0.75 0DTE compression.
+# The backtest always runs intraday (T = hours left today), so is always effectively 0DTE.
+_IV_RANK_THRESHOLD = 52.5
+
+# Rolling window for IV rank: ~1 trading year of every-bar HV samples
+_IV_RANK_WINDOW = _TRADING_DAYS * _BARS_PER_DAY
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +98,7 @@ def _bs(S: float, K: float, T: float, sigma: float, kind: str) -> float:
 
 
 def _hv(closes: list[float]) -> float:
-    """Annualized realized volatility from 5-min closes (floor 10%, cap 200%)."""
+    """Annualised realized volatility from 5-min closes (floor 10%, cap 200%)."""
     if len(closes) < 5:
         return 0.30
     rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
@@ -86,8 +123,9 @@ class ORBOptionsConfig(StrategyConfig, frozen=True):
     close_hour: int = 15
     close_minute: int = 45
     min_or_pct: float = 0.005
-    iv_threshold: float = 0.45
     spy_bar_type: BarType | None = None
+    # Quality filters are sourced directly from config.py at module level
+    # (NautilusTrader frozen configs cannot hold lists or arbitrary objects).
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +142,7 @@ class ORBOptionsStrategy(Strategy):
         super().__init__(config)
         self.trades: list[dict] = []
         self._closes: list[float] = []
+        self._hv_history: deque = deque(maxlen=_IV_RANK_WINDOW)
         self._open_trade: dict | None = None
         self._current_date: date | None = None
         self._spy_open: float | None = None
@@ -145,6 +184,20 @@ class ORBOptionsStrategy(Strategy):
         return hours / (_TRADING_DAYS * 6.5)
 
     # ------------------------------------------------------------------
+    # IV rank (rolling HV percentile — approximates live IV rank)
+    # ------------------------------------------------------------------
+
+    def _iv_rank(self, iv: float) -> float:
+        """Return IV rank 0–100 based on rolling HV history."""
+        if len(self._hv_history) < 20:
+            return 50.0   # not enough history — neutral
+        hist = list(self._hv_history)
+        hv_min, hv_max = min(hist), max(hist)
+        if hv_max <= hv_min:
+            return 50.0
+        return max(0.0, min(100.0, (iv - hv_min) / (hv_max - hv_min) * 100))
+
+    # ------------------------------------------------------------------
     # SPY trend
     # ------------------------------------------------------------------
 
@@ -166,9 +219,25 @@ class ORBOptionsStrategy(Strategy):
     # Options entry
     # ------------------------------------------------------------------
 
-    def _enter(self, price: float, dt_et: datetime, signal: str, iv: float) -> None:
+    def _enter(self, price: float, dt_et: datetime, signal: str,
+               iv: float, iv_rank: float) -> None:
+
+        # --- Pre-entry filters ---
+
+        # Minimum underlying price (illiquid options on cheap stocks)
+        if price < MIN_UNDERLYING_PRICE:
+            return
+
+        # Monday skip — 8.7% win rate on IC-dominant symbols
+        if SKIP_MONDAY_ENTRIES and dt_et.weekday() == 0:
+            return
+
+        # Entry time cutoff — win rate drops to 7.5% after 12:30 PM
+        if dt_et.time() >= time(IC_MAX_ENTRY_HOUR, IC_MAX_ENTRY_MINUTE):
+            return
+
         or_high = self._or_high
-        or_low = self._or_low
+        or_low  = self._or_low
         or_range = or_high - or_low
         T = self._years_remaining(dt_et)
         spy = self._spy_bullish()
@@ -177,14 +246,24 @@ class ORBOptionsStrategy(Strategy):
         entry_cost = 0.0
         meta: dict = {}
 
-        if iv > self.config.iv_threshold and signal == "range_bound":
-            # Iron Condor — sell premium around the OR boundaries
+        if iv_rank > _IV_RANK_THRESHOLD and signal == "range_bound":
+            # ----------------------------------------------------------------
+            # Iron Condor — sell premium around sigma-based OTM strikes
+            # ----------------------------------------------------------------
             strategy = "Iron Condor"
             w = 5.0 if price > 100 else (2.0 if price > 50 else 1.0)
-            sc_k, lc_k = or_high, or_high + w
-            sp_k, lp_k = or_low, or_low - w
 
-            if lp_k <= 0:   # stock too cheap to fit put spread below OR low
+            # Sigma-based strike placement: short strikes ≥ IC_SIGMA_MULTIPLE × expected move
+            expected_move = price * iv * math.sqrt(T) if T > 0 else 0.0
+            min_call_k = price + IC_SIGMA_MULTIPLE * expected_move
+            max_put_k  = price - IC_SIGMA_MULTIPLE * expected_move
+
+            sc_k = max(or_high, min_call_k)
+            lc_k = sc_k + w
+            sp_k = min(or_low,  max_put_k)
+            lp_k = sp_k - w
+
+            if lp_k <= 0:
                 return
 
             sc = _bs(price, sc_k, T, iv, "call")
@@ -195,17 +274,28 @@ class ORBOptionsStrategy(Strategy):
             net_credit = (sc + sp) - (lc + lp)
             if net_credit <= 0:
                 return
-            entry_cost = -net_credit          # negative = we received premium
+
+            # Minimum credit-to-width ratio
+            if net_credit / w < IC_MIN_CREDIT_RATIO:
+                return
+
+            entry_cost = -net_credit
             risk = w - net_credit
             qty = max(1, int(self.config.position_size_usd / max(0.01, risk * 100)))
-            meta = dict(sc_k=sc_k, lc_k=lc_k, sp_k=sp_k, lp_k=lp_k, width=w, qty=qty)
+            meta = dict(sc_k=sc_k, lc_k=lc_k, sp_k=sp_k, lp_k=lp_k,
+                        width=w, qty=qty, initial_credit=net_credit)
 
-        elif iv <= self.config.iv_threshold:
+        elif iv_rank <= _IV_RANK_THRESHOLD:
             if signal == "breakout_above":
+                # Minimum breakout strength filter for directional trades
+                strength = (price - or_high) / or_high
+                if strength < MIN_BREAKOUT_STRENGTH_PCT:
+                    return
+
                 if spy is True:
                     strategy = "Bull Call Spread"
                     k_long, k_short = or_high, or_high + or_range
-                    lc = _bs(price, k_long, T, iv, "call")
+                    lc = _bs(price, k_long,  T, iv, "call")
                     sc = _bs(price, k_short, T, iv, "call")
                     entry_cost = max(0.05, lc - sc)
                     qty = max(1, int(self.config.position_size_usd / (entry_cost * 100)))
@@ -218,10 +308,15 @@ class ORBOptionsStrategy(Strategy):
                     meta = dict(k=k, qty=qty)
 
             elif signal == "breakout_below":
+                # Minimum breakout strength filter for directional trades
+                strength = (or_low - price) / or_low
+                if strength < MIN_BREAKOUT_STRENGTH_PCT:
+                    return
+
                 if spy is False:
                     strategy = "Bear Put Spread"
                     k_long, k_short = or_low, or_low - or_range
-                    lp = _bs(price, k_long, T, iv, "put")
+                    lp = _bs(price, k_long,  T, iv, "put")
                     sp = _bs(price, k_short, T, iv, "put")
                     entry_cost = max(0.05, lp - sp)
                     qty = max(1, int(self.config.position_size_usd / (entry_cost * 100)))
@@ -249,9 +344,9 @@ class ORBOptionsStrategy(Strategy):
         )
         self._traded = True
         self.log.info(
-            f"ENTRY {strategy} | px={price:.2f} iv={iv:.1%}"
-            f" cost=${entry_cost:.2f} qty={meta.get('qty',1)}"
-            f" total=${entry_cost*meta.get('qty',1)*100:.0f}"
+            f"ENTRY {strategy} | px={price:.2f} iv={iv:.1%} iv_rank={iv_rank:.0f}"
+            f" cost=${entry_cost:.2f} qty={meta.get('qty', 1)}"
+            f" total=${entry_cost * meta.get('qty', 1) * 100:.0f}"
         )
 
     # ------------------------------------------------------------------
@@ -274,21 +369,20 @@ class ORBOptionsStrategy(Strategy):
             lc = _bs(price, meta["lc_k"], T, iv, "call")
             sp = _bs(price, meta["sp_k"], T, iv, "put")
             lp = _bs(price, meta["lp_k"], T, iv, "put")
-            # Cost to close = buy back short legs, sell long legs
             cost_to_close = (sc + sp) - (lc + lp)
-            exit_value = -cost_to_close   # negative = we pay to close
+            exit_value = -cost_to_close
 
         elif strategy == "Bull Call Spread":
-            exit_value = _bs(price, meta["k_long"], T, iv, "call") - \
-                         _bs(price, meta["k_short"], T, iv, "call")
+            exit_value = (_bs(price, meta["k_long"],  T, iv, "call") -
+                          _bs(price, meta["k_short"], T, iv, "call"))
 
         elif strategy == "Bear Put Spread":
-            exit_value = _bs(price, meta["k_long"], T, iv, "put") - \
-                         _bs(price, meta["k_short"], T, iv, "put")
+            exit_value = (_bs(price, meta["k_long"],  T, iv, "put") -
+                          _bs(price, meta["k_short"], T, iv, "put"))
 
         else:  # Straddle
-            exit_value = _bs(price, meta["k"], T, iv, "call") + \
-                         _bs(price, meta["k"], T, iv, "put")
+            exit_value = (_bs(price, meta["k"], T, iv, "call") +
+                          _bs(price, meta["k"], T, iv, "put"))
 
         pnl = (exit_value - t["entry_cost"]) * qty * 100
 
@@ -334,13 +428,17 @@ class ORBOptionsStrategy(Strategy):
         if len(self._closes) > 30:
             self._closes.pop(0)
 
+        # Update rolling IV history every bar
+        iv = _hv(self._closes)
+        self._hv_history.append(iv)
+
         # Phase 1 — build opening range
         if not self._range_ready:
             if time(9, 30) <= bar_time < time(10, 0):
                 h = bar.high.as_double()
                 l = bar.low.as_double()
                 self._or_high = max(self._or_high, h) if self._or_high else h
-                self._or_low = min(self._or_low, l) if self._or_low else l
+                self._or_low  = min(self._or_low,  l) if self._or_low  else l
                 self._or_vol_sum += bar.volume.as_double()
                 self._or_bars += 1
                 if self._or_bars >= self.config.orb_range_bars:
@@ -361,27 +459,51 @@ class ORBOptionsStrategy(Strategy):
 
         # Phase 3 — manage open position
         if self._open_trade is not None:
-            strat = self._open_trade["strategy"]
-            or_h = self._open_trade["or_high"]
-            or_l = self._open_trade["or_low"]
-            or_r = self._open_trade["or_range"]
-            stop_buf = self.config.stop_buffer
-            mult = self.config.profit_multiplier
+            t    = self._open_trade
+            strat = t["strategy"]
+            or_h  = t["or_high"]
+            or_l  = t["or_low"]
+            or_r  = t["or_range"]
+            mult  = self.config.profit_multiplier
 
-            if strat in ("Bull Call Spread", "Straddle") and self._open_trade["entry_price"] > or_h:
-                if close <= or_l - stop_buf:
+            if strat in ("Bull Call Spread", "Straddle") and t["entry_price"] > or_h:
+                if close <= or_l - self.config.stop_buffer:
                     self._exit(close, dt_et, "STOP")
                 elif close >= or_h + or_r * mult:
                     self._exit(close, dt_et, "TARGET")
 
-            elif strat in ("Bear Put Spread", "Straddle") and self._open_trade["entry_price"] < or_l:
-                if close >= or_h + stop_buf:
+            elif strat in ("Bear Put Spread", "Straddle") and t["entry_price"] < or_l:
+                if close >= or_h + self.config.stop_buffer:
                     self._exit(close, dt_et, "STOP")
                 elif close <= or_l - or_r * mult:
                     self._exit(close, dt_et, "TARGET")
 
             elif strat == "Iron Condor":
-                if close >= or_h or close <= or_l:
+                sc_k = t["meta"]["sc_k"]
+                lc_k = t["meta"]["lc_k"]
+                sp_k = t["meta"]["sp_k"]
+                lp_k = t["meta"]["lp_k"]
+                initial_credit = t["meta"].get("initial_credit", 0.0)
+                T_now = self._years_remaining(dt_et)
+
+                # P&L-based exits (profit target + credit-multiple stop)
+                if initial_credit > 0:
+                    sc_now = _bs(close, sc_k, T_now, iv, "call")
+                    lc_now = _bs(close, lc_k, T_now, iv, "call")
+                    sp_now = _bs(close, sp_k, T_now, iv, "put")
+                    lp_now = _bs(close, lp_k, T_now, iv, "put")
+                    cost_to_close = (sc_now + sp_now) - (lc_now + lp_now)
+                    unrealized_pnl = initial_credit - cost_to_close
+
+                    if unrealized_pnl >= IC_PROFIT_TARGET_PCT * initial_credit:
+                        self._exit(close, dt_et, "TARGET")
+                        return
+                    if unrealized_pnl <= -(IC_PNL_STOP_MULTIPLE * initial_credit):
+                        self._exit(close, dt_et, "STOP")
+                        return
+
+                # Price-based stop at the sigma-placed short strikes
+                if close >= sc_k or close <= sp_k:
                     self._exit(close, dt_et, "STOP")
             return
 
@@ -390,8 +512,8 @@ class ORBOptionsStrategy(Strategy):
             return
 
         avg_vol = self._or_vol_sum / max(self._or_bars, 1)
-        vol_ok = bar.volume.as_double() >= avg_vol * self.config.volume_factor
-        or_r = self._or_high - self._or_low
+        vol_ok  = bar.volume.as_double() >= avg_vol * self.config.volume_factor
+        or_r    = self._or_high - self._or_low
         after_1030 = bar_time >= time(10, 30)
 
         is_range = (
@@ -399,14 +521,14 @@ class ORBOptionsStrategy(Strategy):
             and (self._or_low + 0.2 * or_r) <= close <= (self._or_high - 0.2 * or_r)
         )
 
-        iv = _hv(self._closes)
+        iv_rank = self._iv_rank(iv)
 
         if close > self._or_high and vol_ok:
-            self._enter(close, dt_et, "breakout_above", iv)
+            self._enter(close, dt_et, "breakout_above", iv, iv_rank)
         elif close < self._or_low and vol_ok:
-            self._enter(close, dt_et, "breakout_below", iv)
-        elif is_range and iv > self.config.iv_threshold:
-            self._enter(close, dt_et, "range_bound", iv)
+            self._enter(close, dt_et, "breakout_below", iv, iv_rank)
+        elif is_range and iv_rank > _IV_RANK_THRESHOLD:
+            self._enter(close, dt_et, "range_bound", iv, iv_rank)
 
     def on_stop(self) -> None:
         if self._open_trade is not None:
@@ -427,6 +549,7 @@ class ORBOptionsStrategy(Strategy):
         self._spy_last = None
         self._spy_date = None
         self._closes = []
+        self._hv_history.clear()
 
     def on_save(self) -> dict[str, bytes]:
         return {}

@@ -4,6 +4,7 @@ Fetches options chains via yfinance, evaluates Implied Volatility (IV),
 and dynamically submits multi-leg defined-risk orders (Spreads, Straddles, Iron Condors).
 """
 import logging
+import math
 import os
 import re
 from datetime import datetime, time, date, timezone, timedelta
@@ -35,6 +36,17 @@ from config import (
     ORB_VOLUME_FACTOR,
     DAILY_LOSS_LIMIT_PCT,
     MAX_DRAWDOWN_PCT,
+    IC_MAX_DTE,
+    MIN_UNDERLYING_PRICE,
+    IC_MIN_CREDIT_RATIO,
+    IC_SIGMA_MULTIPLE,
+    IC_PROFIT_TARGET_PCT,
+    IC_PNL_STOP_MULTIPLE,
+    ORB_OPTIONS_BLOCKLIST,
+    SKIP_MONDAY_ENTRIES,
+    IC_MAX_ENTRY_HOUR,
+    IC_MAX_ENTRY_MINUTE,
+    MIN_BREAKOUT_STRENGTH_PCT,
 )
 from screener import get_active_symbols
 
@@ -303,6 +315,77 @@ def close_all_legs(positions: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Market situation classifier
+# ---------------------------------------------------------------------------
+
+from enum import Enum
+
+
+class MarketSituation(Enum):
+    PREMIUM_SELL      = "premium_sell"       # Range-bound + high IV → Iron Condor
+    DIRECTIONAL_FULL  = "directional_full"   # Breakout + low IV + all signals → debit spread
+    STRADDLE_PLAY     = "straddle_play"      # Breakout + low IV + partial signals → Straddle
+    VOLATILITY_SPIKE  = "volatility_spike"   # Breakout + high IV → skip (overpriced + risky)
+    LOW_IV_RANGEBOUND = "low_iv_rangebound"  # Range-bound + low IV → skip (no edge)
+    NO_SETUP          = "no_setup"           # No clean signal
+
+
+def _classify_situation(
+    is_breakout_above: bool,
+    is_breakout_below: bool,
+    is_range_bound: bool,
+    iv_rank: float,
+    iv_rank_threshold: float,
+    spy_bullish: bool | None,
+    daily_trend: str,
+    iv_skew: float,
+) -> tuple[MarketSituation, int]:
+    """
+    Map all market signals to a single MarketSituation and a directional
+    confirmation score (0–3). The score counts how many of the three
+    independent confirmation signals (SPY trend, daily trend, IV skew) agree
+    with the breakout direction.
+
+    Score 3 → DIRECTIONAL_FULL (debit spread)
+    Score 1–2 → STRADDLE_PLAY (expect a move, unsure of direction)
+    Score 0 → NO_SETUP
+    """
+    high_iv = iv_rank > iv_rank_threshold
+    is_breakout = is_breakout_above or is_breakout_below
+
+    # ── Range-bound scenarios ────────────────────────────────────────────────
+    if is_range_bound and not is_breakout:
+        if high_iv:
+            return MarketSituation.PREMIUM_SELL, 0
+        return MarketSituation.LOW_IV_RANGEBOUND, 0
+
+    # ── Breakout scenarios ───────────────────────────────────────────────────
+    if is_breakout:
+        if high_iv:
+            # Breakout into elevated IV: IC is dangerous (one side will breach),
+            # debit spread is overpriced. Best to stay flat.
+            return MarketSituation.VOLATILITY_SPIKE, 0
+
+        # Low IV + breakout: score directional confirmation signals
+        confirmed = 0
+        if is_breakout_above:
+            if spy_bullish is True:       confirmed += 1
+            if daily_trend == "BULLISH":  confirmed += 1
+            if iv_skew >= -0.05:          confirmed += 1   # calls not overpriced vs puts
+        else:  # breakout_below
+            if spy_bullish is False:      confirmed += 1
+            if daily_trend == "BEARISH":  confirmed += 1
+            if iv_skew <= 0.05:           confirmed += 1   # puts not wildly expensive
+
+        if confirmed == 3:
+            return MarketSituation.DIRECTIONAL_FULL, confirmed
+        if confirmed >= 1:
+            return MarketSituation.STRADDLE_PLAY, confirmed
+
+    return MarketSituation.NO_SETUP, 0
+
+
+# ---------------------------------------------------------------------------
 # Strategy logic
 # ---------------------------------------------------------------------------
 
@@ -336,6 +419,17 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
     current_volume = float(current_bar["volume"])
     now_et = get_now_et()
 
+    # Minimum underlying price — cheap stocks have illiquid options and wide spreads
+    if current_price < MIN_UNDERLYING_PRICE:
+        log.info(f"{symbol} | Price ${current_price:.2f} < ${MIN_UNDERLYING_PRICE:.0f} minimum — skipping (illiquid options)")
+        return False
+
+    # Entry time cutoff — backtest win rate after 12:30 PM drops to 7.5% (3/40 trades)
+    cutoff = time(IC_MAX_ENTRY_HOUR, IC_MAX_ENTRY_MINUTE)
+    if now_et.time() >= cutoff:
+        log.info(f"{symbol} | After {cutoff.strftime('%H:%M')} ET entry cutoff — skipping (backtest win rate 7.5% after this time)")
+        return False
+
     # Budget Check
     if open_positions_count >= max_open_positions:
         log.info(f"{symbol} | Budget limit reached ({open_positions_count}/{max_open_positions} trades open) — skipping entry to stay under ${MAX_OPTIONS_INVESTMENT}")
@@ -349,10 +443,30 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
     is_breakout_above = current_price > or_high
     is_breakout_below = current_price < or_low
     vol_ok = current_volume >= avg_or_volume * ORB_VOLUME_FACTOR
-    
+
+    # Minimum breakout strength — weak breakouts (<0.5% through OR) have 15% win rate in
+    # backtest vs 52% for breakouts >1%. Only applies to directional strategies; ICs are
+    # range-bound entries and are unaffected.
+    if is_breakout_above:
+        strength = (current_price - or_high) / or_high
+        if strength < MIN_BREAKOUT_STRENGTH_PCT:
+            log.info(
+                f"{symbol} | Breakout too weak ({strength:.2%} < {MIN_BREAKOUT_STRENGTH_PCT:.1%}) "
+                "— skipping directional entry"
+            )
+            is_breakout_above = False
+    if is_breakout_below:
+        strength = (or_low - current_price) / or_low
+        if strength < MIN_BREAKOUT_STRENGTH_PCT:
+            log.info(
+                f"{symbol} | Breakdown too weak ({strength:.2%} < {MIN_BREAKOUT_STRENGTH_PCT:.1%}) "
+                "— skipping directional entry"
+            )
+            is_breakout_below = False
+
     is_after_1030 = now_et.time() >= time(10, 30)
     is_range_bound = (
-        is_after_1030 and 
+        is_after_1030 and
         (or_low + 0.2 * or_range) <= current_price <= (or_high - 0.2 * or_range)
     )
 
@@ -438,163 +552,198 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
     strategy = None
     legs = []
     qty = 0
-    limit_price = 0.05  # set per strategy below; positive = debit, negative = credit
+    limit_price = 0.05  # positive = debit paid, negative = credit received
 
-    # Strategy selection based on IV Rank + Regime (QuantTrading regime_detector.py)
-    # RANGING regime → lower threshold to strongly prefer Iron Condors
-    # TRENDING regime → raise threshold to prefer debit spreads
-    # 0DTE → compress threshold regardless (IV always elevated)
+    # IV rank threshold: adjusted for regime (RANGING→aggressive, TRENDING→conservative)
+    # then compressed 25% on 0DTE because IV is structurally elevated on expiry day.
     if regime_label == "RANGING":
-        iv_rank_threshold = 50.0   # sell premium more aggressively in range-bound market
+        iv_rank_threshold = 50.0
     elif regime_label == "TRENDING":
-        iv_rank_threshold = 80.0   # require truly expensive IV before selling premium
+        iv_rank_threshold = 80.0
     else:
-        iv_rank_threshold = 70.0   # NORMAL / HIGH_VOL
-
+        iv_rank_threshold = 70.0
     if is_0dte:
-        iv_rank_threshold *= 0.75   # 0DTE: IV always elevated, compress threshold
-        log.info(f"{symbol} | 0DTE IV rank threshold → {iv_rank_threshold:.1f} (prefer Iron Condors)")
+        iv_rank_threshold *= 0.75
+        log.info(f"{symbol} | 0DTE IV rank threshold → {iv_rank_threshold:.1f}")
 
-    if iv_rank > iv_rank_threshold and is_range_bound:
-        # Strategy: Iron Condor (High IV & Range-bound)
-        strategy = "Iron Condor"
-        
-        # Strike spacing based on price
-        if current_price > 100:
-            width = 5.0
-        elif current_price > 50:
-            width = 2.0
-        else:
-            width = 1.0
+    # ── Classify the market situation ────────────────────────────────────────
+    situation, confirmation_score = _classify_situation(
+        is_breakout_above, is_breakout_below, is_range_bound,
+        iv_rank, iv_rank_threshold, spy_bullish, stock_daily_trend, iv_skew,
+    )
+    direction_arrow = "↑" if is_breakout_above else ("↓" if is_breakout_below else "–")
+    log.info(
+        f"{symbol} | Situation: {situation.value.upper()} "
+        f"| IV Rank: {iv_rank:.0f}/{iv_rank_threshold:.0f} "
+        f"| Breakout: {direction_arrow} "
+        f"| Confirmation: {confirmation_score}/3"
+    )
 
-        # Short Call: strike closest to or_high (must be > current_price)
-        sc_candidates = calls[calls['strike'] > current_price]
-        if sc_candidates.empty:
-            log.warning(f"{symbol} | No short call candidates")
+    # ── Skip situations ───────────────────────────────────────────────────────
+    if situation == MarketSituation.VOLATILITY_SPIKE:
+        log.info(
+            f"{symbol} | VOLATILITY_SPIKE — price breaking out with IV rank {iv_rank:.0f} "
+            "already elevated; IC risks breach, debit spread overpriced — skipping"
+        )
+        return False
+
+    if situation == MarketSituation.LOW_IV_RANGEBOUND:
+        log.info(
+            f"{symbol} | LOW_IV_RANGEBOUND — range-bound but IV rank {iv_rank:.0f} too low "
+            f"for profitable IC credit (threshold {iv_rank_threshold:.0f}) — skipping"
+        )
+        return False
+
+    if situation == MarketSituation.NO_SETUP:
+        log.info(f"{symbol} | NO_SETUP — no clean signal, no trade")
+        return False
+
+    # ── Iron Condor ───────────────────────────────────────────────────────────
+    if situation == MarketSituation.PREMIUM_SELL:
+        # Gate 1: DTE limit
+        dte = (date.fromisoformat(nearest_expiry) - date.today()).days
+        if dte > IC_MAX_DTE:
+            log.info(
+                f"{symbol} | IC rejected: DTE={dte} > IC_MAX_DTE={IC_MAX_DTE} "
+                "(multi-day condors breach almost always)"
+            )
             return False
-        short_call = sc_candidates.iloc[(sc_candidates['strike'] - or_high).abs().argsort()].iloc[0]
-        
-        # Long Call: strike closest to short_call strike + width
+
+        strategy = "Iron Condor"
+        width = 5.0 if current_price > 100 else (2.0 if current_price > 50 else 1.0)
+
+        # Gate 2: sigma-based strike placement
+        holding_days = max(1, dte + 1)
+        expected_move = current_price * avg_atm_iv * math.sqrt(holding_days / 252)
+        min_call_strike = current_price + IC_SIGMA_MULTIPLE * expected_move
+        max_put_strike  = current_price - IC_SIGMA_MULTIPLE * expected_move
+        log.info(
+            f"{symbol} | IC expected move: ${expected_move:.2f} over {holding_days}d "
+            f"| min call strike: ${min_call_strike:.2f} | max put strike: ${max_put_strike:.2f}"
+        )
+
+        sc_target = max(or_high, min_call_strike)
+        sc_candidates = calls[calls['strike'] >= sc_target]
+        if sc_candidates.empty:
+            sc_candidates = calls[calls['strike'] > current_price]
+        if sc_candidates.empty:
+            log.warning(f"{symbol} | IC rejected: no short call candidates above ${sc_target:.2f}")
+            return False
+        short_call = sc_candidates.iloc[(sc_candidates['strike'] - sc_target).abs().argsort()].iloc[0]
+
         lc_candidates = calls[calls['strike'] > short_call['strike']]
         if lc_candidates.empty:
-            log.warning(f"{symbol} | No long call candidates")
+            log.warning(f"{symbol} | IC rejected: no long call candidates")
             return False
         long_call = lc_candidates.iloc[(lc_candidates['strike'] - (short_call['strike'] + width)).abs().argsort()].iloc[0]
 
-        # Short Put: strike closest to or_low (must be < current_price)
-        sp_candidates = puts[puts['strike'] < current_price]
+        sp_target = min(or_low, max_put_strike)
+        sp_candidates = puts[puts['strike'] <= sp_target]
         if sp_candidates.empty:
-            log.warning(f"{symbol} | No short put candidates")
+            sp_candidates = puts[puts['strike'] < current_price]
+        if sp_candidates.empty:
+            log.warning(f"{symbol} | IC rejected: no short put candidates below ${sp_target:.2f}")
             return False
-        short_put = sp_candidates.iloc[(sp_candidates['strike'] - or_low).abs().argsort()].iloc[0]
+        short_put = sp_candidates.iloc[(sp_candidates['strike'] - sp_target).abs().argsort()].iloc[0]
 
-        # Long Put: strike closest to short_put strike - width
         lp_candidates = puts[puts['strike'] < short_put['strike']]
         if lp_candidates.empty:
-            log.warning(f"{symbol} | No long put candidates")
+            log.warning(f"{symbol} | IC rejected: no long put candidates")
             return False
         long_put = lp_candidates.iloc[(lp_candidates['strike'] - (short_put['strike'] - width)).abs().argsort()].iloc[0]
 
-        # Compute net credit received
         net_credit = (
             (float(short_call['bid']) - float(long_call['ask'])) +
-            (float(short_put['bid']) - float(long_put['ask']))
+            (float(short_put['bid'])  - float(long_put['ask']))
         )
-        if net_credit <= 0:
-            log.warning(f"{symbol} | Iron Condor net credit is negative ({net_credit:.2f}) — skipping")
+        credit_ratio = net_credit / width
+
+        # Gate 3: minimum credit-to-width ratio
+        if net_credit <= 0 or credit_ratio < IC_MIN_CREDIT_RATIO:
+            log.info(
+                f"{symbol} | IC rejected: credit ${net_credit:.2f} = "
+                f"{credit_ratio:.1%} of width ${width:.0f} "
+                f"(need ≥{IC_MIN_CREDIT_RATIO:.0%}) — negative EV"
+            )
             return False
 
-        risk = width - net_credit
-        if risk <= 0:
-            risk = 0.05
-        
+        risk = max(0.05, width - net_credit)
         qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (risk * 100)))
         legs = [
             OptionLegRequest(symbol=short_call['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
-            OptionLegRequest(symbol=long_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-            OptionLegRequest(symbol=short_put['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
-            OptionLegRequest(symbol=long_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+            OptionLegRequest(symbol=long_call['contractSymbol'],  side=OrderSide.BUY,  ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+            OptionLegRequest(symbol=short_put['contractSymbol'],  side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+            OptionLegRequest(symbol=long_put['contractSymbol'],   side=OrderSide.BUY,  ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
         ]
-        limit_price = -round(net_credit, 2)  # negative = credit received
-        log.info(f"{symbol} | Iron Condor | Credit: ${net_credit:.2f} | Risk: ${risk:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
+        limit_price = -round(net_credit, 2)
+        log.info(
+            f"{symbol} | Iron Condor | "
+            f"Strikes: put ${short_put['strike']:.2f}/${long_put['strike']:.2f} "
+            f"call ${short_call['strike']:.2f}/${long_call['strike']:.2f} | "
+            f"Credit: ${net_credit:.2f} ({credit_ratio:.0%} of width) | "
+            f"Risk: ${risk:.2f} | Qty: {qty}"
+        )
 
-    elif iv_rank <= iv_rank_threshold:
-        # Low IV Rank: we BUY premium
+    # ── Bull Call Spread / Bear Put Spread (all 3 signals confirmed) ──────────
+    elif situation == MarketSituation.DIRECTIONAL_FULL:
         if is_breakout_above:
-            # Bull Call Spread: SPY bullish AND stock daily trend not bearish AND skew confirms
-            if spy_bullish is True and stock_daily_trend != "BEARISH" and iv_skew >= -0.05:
-                # Bull Call Spread (all three filters aligned: SPY, daily trend, skew)
-                strategy = "Bull Call Spread"
-                long_call = atm_call
-                
-                oc_candidates = calls[calls['strike'] > long_call['strike']]
-                if oc_candidates.empty:
-                    log.warning(f"{symbol} | No short call candidates for spread")
-                    return False
-                short_call = oc_candidates.iloc[(oc_candidates['strike'] - (long_call['strike'] + or_range)).abs().argsort()].iloc[0]
+            strategy = "Bull Call Spread"
+            long_call = atm_call
+            oc_candidates = calls[calls['strike'] > long_call['strike']]
+            if oc_candidates.empty:
+                log.warning(f"{symbol} | Bull Call Spread rejected: no short call candidates")
+                return False
+            short_call = oc_candidates.iloc[(oc_candidates['strike'] - (long_call['strike'] + or_range)).abs().argsort()].iloc[0]
+            net_debit = max(0.05, float(long_call['ask']) - float(short_call['bid']))
+            qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
+            legs = [
+                OptionLegRequest(symbol=long_call['contractSymbol'],  side=OrderSide.BUY,  ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                OptionLegRequest(symbol=short_call['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+            ]
+            limit_price = round(net_debit, 2)
+            log.info(
+                f"{symbol} | Bull Call Spread ↑ | Confirmation: {confirmation_score}/3 "
+                f"(SPY={'✓' if spy_bullish else '✗'} Daily={stock_daily_trend} Skew={iv_skew:+.3f}) "
+                f"| Debit: ${net_debit:.2f} | Qty: {qty}"
+            )
+        else:
+            strategy = "Bear Put Spread"
+            long_put = atm_put
+            op_candidates = puts[puts['strike'] < long_put['strike']]
+            if op_candidates.empty:
+                log.warning(f"{symbol} | Bear Put Spread rejected: no short put candidates")
+                return False
+            short_put = op_candidates.iloc[(op_candidates['strike'] - (long_put['strike'] - or_range)).abs().argsort()].iloc[0]
+            net_debit = max(0.05, float(long_put['ask']) - float(short_put['bid']))
+            qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
+            legs = [
+                OptionLegRequest(symbol=long_put['contractSymbol'],  side=OrderSide.BUY,  ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+                OptionLegRequest(symbol=short_put['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+            ]
+            limit_price = round(net_debit, 2)
+            log.info(
+                f"{symbol} | Bear Put Spread ↓ | Confirmation: {confirmation_score}/3 "
+                f"(SPY={'✓' if spy_bullish is False else '✗'} Daily={stock_daily_trend} Skew={iv_skew:+.3f}) "
+                f"| Debit: ${net_debit:.2f} | Qty: {qty}"
+            )
 
-                net_debit = float(long_call['ask']) - float(short_call['bid'])
-                if net_debit <= 0:
-                    net_debit = 0.05
-                
-                qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
-                legs = [
-                    OptionLegRequest(symbol=long_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=short_call['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
-                ]
-                limit_price = round(net_debit, 2)  # positive = debit paid
-                log.info(f"{symbol} | Bull Call Spread | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
-            else:
-                # Straddle (uncorrelated breakout)
-                strategy = "Straddle"
-                net_debit = float(atm_call['ask']) + float(atm_put['ask'])
-                qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
-                legs = [
-                    OptionLegRequest(symbol=atm_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=atm_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                ]
-                limit_price = round(net_debit, 2)  # positive = debit paid
-                log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
-
-        elif is_breakout_below:
-            # Bear Put Spread: SPY bearish AND stock daily trend not bullish AND skew confirms
-            if spy_bullish is False and stock_daily_trend != "BULLISH" and iv_skew <= 0.05:
-                # Bear Put Spread (all three filters aligned: SPY, daily trend, skew)
-                strategy = "Bear Put Spread"
-                long_put = atm_put
-                
-                op_candidates = puts[puts['strike'] < long_put['strike']]
-                if op_candidates.empty:
-                    log.warning(f"{symbol} | No short put candidates for spread")
-                    return False
-                short_put = op_candidates.iloc[(op_candidates['strike'] - (long_put['strike'] - or_range)).abs().argsort()].iloc[0]
-
-                net_debit = float(long_put['ask']) - float(short_put['bid'])
-                if net_debit <= 0:
-                    net_debit = 0.05
-
-                qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
-                legs = [
-                    OptionLegRequest(symbol=long_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=short_put['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
-                ]
-                limit_price = round(net_debit, 2)  # positive = debit paid
-                log.info(f"{symbol} | Bear Put Spread | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
-            else:
-                # Straddle (uncorrelated breakdown)
-                strategy = "Straddle"
-                net_debit = float(atm_call['ask']) + float(atm_put['ask'])
-                qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
-                legs = [
-                    OptionLegRequest(symbol=atm_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                    OptionLegRequest(symbol=atm_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                ]
-                limit_price = round(net_debit, 2)  # positive = debit paid
-                log.info(f"{symbol} | Straddle | Debit: ${net_debit:.2f} | Qty: {qty} | Limit: ${limit_price:.2f}")
+    # ── Straddle (breakout with mixed directional signals) ────────────────────
+    elif situation == MarketSituation.STRADDLE_PLAY:
+        strategy = "Straddle"
+        net_debit = float(atm_call['ask']) + float(atm_put['ask'])
+        qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
+        legs = [
+            OptionLegRequest(symbol=atm_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+            OptionLegRequest(symbol=atm_put['contractSymbol'],  side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
+        ]
+        limit_price = round(net_debit, 2)
+        log.info(
+            f"{symbol} | Straddle {direction_arrow} | Confirmation: {confirmation_score}/3 "
+            f"(move expected, direction mixed) | Debit: ${net_debit:.2f} | Qty: {qty}"
+        )
 
     if strategy is None:
-        log.info(f"{symbol} | No options setup matched the criteria "
-                 f"(IV: {avg_atm_iv:.2%} | IV Rank: {iv_rank:.0f} | Skew: {iv_skew:+.3f})")
+        log.info(f"{symbol} | No strategy built for situation={situation.value} — check chain availability")
         return False
 
     # Place MLEG order
@@ -719,6 +868,33 @@ def manage_existing_options_positions(underlying_symbol: str, positions: list, s
             close_all_legs(positions)
 
     elif strategy == "iron_condor":
+        # P&L-based exits: profit target + credit-multiple stop
+        try:
+            net_credit_received = (
+                sum(abs(float(p.cost_basis)) for p in positions if float(p.qty) < 0) -
+                sum(abs(float(p.cost_basis)) for p in positions if float(p.qty) > 0)
+            )
+            total_pnl = sum(float(p.unrealized_pl) for p in positions)
+        except Exception:
+            net_credit_received = 0.0
+            total_pnl = 0.0
+
+        if net_credit_received > 0:
+            if total_pnl >= IC_PROFIT_TARGET_PCT * net_credit_received:
+                log.info(
+                    f"TAKE PROFIT — Closing Iron Condor for {underlying_symbol} "
+                    f"(P&L ${total_pnl:.2f} >= {IC_PROFIT_TARGET_PCT:.0%} of credit ${net_credit_received:.2f})"
+                )
+                close_all_legs(positions)
+                return
+            if total_pnl <= -(IC_PNL_STOP_MULTIPLE * net_credit_received):
+                log.info(
+                    f"P&L STOP — Closing Iron Condor for {underlying_symbol} "
+                    f"(P&L ${total_pnl:.2f} <= -{IC_PNL_STOP_MULTIPLE:.0f}× credit ${net_credit_received:.2f})"
+                )
+                close_all_legs(positions)
+                return
+
         # Stop at the SHORT STRIKES — parsed directly from the OCC contract symbols.
         # Previously this used today's OR high/low which is wrong for multi-day condors.
         sc_strike, sp_strike = _get_short_strikes(positions)
@@ -830,12 +1006,21 @@ def run_orb_options() -> None:
         log.warning("Risk limits active — skipping new entries, existing positions still managed")
         return
 
+    # Monday skip — 14.3% backtest win rate vs 26–31% Tue–Thu
+    if SKIP_MONDAY_ENTRIES and now_et.weekday() == 0:
+        log.info("Monday — skipping all new entries (backtest win rate 14.3%)")
+        return
+
     active_symbols = get_active_symbols()
     if not active_symbols:
         log.warning("No active symbols found from screener. Skipping new entries.")
     else:
+        blocklist = set(ORB_OPTIONS_BLOCKLIST)
         for symbol in active_symbols:
             if symbol in held_symbols:
+                continue
+            if symbol in blocklist:
+                log.info(f"{symbol} | In options blocklist — skipping (backtest net loser)")
                 continue
             try:
                 opened_new = process_symbol_options(symbol, spy_bullish, open_positions_count, max_open_positions)

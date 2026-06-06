@@ -41,7 +41,7 @@ from config import (
     ORB_CLOSE_HOUR,
     ORB_CLOSE_MINUTE,
     ORB_MIN_OR_PCT,
-    ORB_OPTIONS_IV_THRESHOLD,
+    ORB_OPTIONS_BLOCKLIST,
     ORB_OPTIONS_POSITION_SIZE,
     ORB_PROFIT_MULTIPLIER,
     ORB_PROFIT_MULTIPLIERS,
@@ -128,7 +128,6 @@ def _run_engine(symbol: str, spy_bars) -> tuple[list[dict], str | None]:
                 close_hour=ORB_CLOSE_HOUR,
                 close_minute=ORB_CLOSE_MINUTE,
                 min_or_pct=ORB_MIN_OR_PCT,
-                iv_threshold=ORB_OPTIONS_IV_THRESHOLD,
                 spy_bar_type=spy_bar_type_arg,
             )
         )
@@ -176,9 +175,13 @@ def _summarize(symbol: str, trades: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def run_single(symbol: str, spy_bars) -> None:
+    if symbol in ORB_OPTIONS_BLOCKLIST:
+        print(f"\n{symbol} is in ORB_OPTIONS_BLOCKLIST — skipping")
+        return
+
     print(f"\n{'='*72}")
     print(f"  ORB Options Backtest — {symbol}")
-    print(f"  ${ORB_OPTIONS_POSITION_SIZE}/trade | IV threshold {ORB_OPTIONS_IV_THRESHOLD:.0%} | Black-Scholes pricing")
+    print(f"  ${ORB_OPTIONS_POSITION_SIZE}/trade | IV rank threshold | Black-Scholes pricing")
     print(f"{'='*72}\n")
 
     trades, err = _run_engine(symbol, spy_bars)
@@ -215,8 +218,12 @@ def run_single(symbol: str, spy_bars) -> None:
 def run_ranking(symbols: list[str]) -> None:
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    print(f"\nRunning ORB Options ranking for {len(symbols)} symbols")
-    print(f"Settings: ${ORB_OPTIONS_POSITION_SIZE}/trade | IV threshold {ORB_OPTIONS_IV_THRESHOLD:.0%}"
+    blocklist = set(ORB_OPTIONS_BLOCKLIST)
+    symbols = [s for s in symbols if s not in blocklist]
+
+    print(f"\nRunning ORB Options ranking for {len(symbols)} symbols"
+          f" (blocklist excluded: {sorted(blocklist)})")
+    print(f"Settings: ${ORB_OPTIONS_POSITION_SIZE}/trade | IV rank threshold"
           f" | Black-Scholes | SPY trend filter\n")
 
     print("Loading SPY bars...", end="  ", flush=True)
@@ -256,7 +263,7 @@ def run_ranking(symbols: list[str]) -> None:
 
     w = 100
     print(f"\n{'='*w}")
-    print(f"  ORB OPTIONS RANKING | ${ORB_OPTIONS_POSITION_SIZE}/trade | IV {ORB_OPTIONS_IV_THRESHOLD:.0%} | Black-Scholes pricing")
+    print(f"  ORB OPTIONS RANKING | ${ORB_OPTIONS_POSITION_SIZE}/trade | IV rank threshold | Black-Scholes pricing")
     print(f"{'='*w}")
     print(f"  {'Rank':<5}{'Symbol':<8}{'Trades':>7}{'Win%':>7}{'Total P&L':>12}"
           f"{'Avg':>10}{'Best':>10}{'Worst':>10}  Strategies")
