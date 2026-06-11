@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import time as _time
 from datetime import datetime, time, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 
@@ -1039,14 +1040,62 @@ if __name__ == "__main__":
         action="store_true",
         help="Log strategy selection and leg structure without submitting any orders",
     )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single check and exit (default is to loop every 5 minutes until market close)",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        metavar="SECONDS",
+        help="Loop interval in seconds (default: 300 = 5 minutes)",
+    )
     args = parser.parse_args()
     DRY_RUN = args.dry_run
 
     if DRY_RUN:
         log.info("*** DRY RUN MODE — no orders will be submitted ***")
 
-    log.info("ORB Options Bot starting (Dynamic Symbols via OpenBB)")
-    log.info(f"OR: first {ORB_RANGE_BARS} bars | ${ORB_OPTIONS_POSITION_SIZE}/trade | Default target: {ORB_PROFIT_MULTIPLIER}× range | EOD: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET")
-    log.info(f"Filters: SPY trend | min OR {ORB_MIN_OR_PCT:.1%} | IV Rank thresholds: RANGING=50 NORMAL=70 TRENDING=80 | daily loss limit {DAILY_LOSS_LIMIT_PCT:.0%}")
-    run_orb_options()
-    log.info("Run complete")
+    ET = ZoneInfo("America/New_York")
+    MARKET_OPEN  = time(9, 30)
+    MARKET_CLOSE = time(ORB_CLOSE_HOUR, ORB_CLOSE_MINUTE)
+
+    log.info("ORB Options Bot starting")
+    log.info(
+        f"OR: first {ORB_RANGE_BARS} bars | ${ORB_OPTIONS_POSITION_SIZE}/trade"
+        f" | Entry window: 10:00–{IC_MAX_ENTRY_HOUR}:{IC_MAX_ENTRY_MINUTE:02d} ET"
+        f" | EOD close: {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET"
+    )
+    log.info(
+        f"Filters: price≥${MIN_UNDERLYING_PRICE:.0f} | credit≥{IC_MIN_CREDIT_RATIO:.0%}"
+        f" | {IC_SIGMA_MULTIPLE}σ strikes | min breakout {MIN_BREAKOUT_STRENGTH_PCT:.1%}"
+        f" | daily loss limit {DAILY_LOSS_LIMIT_PCT:.0%}"
+    )
+
+    if args.once:
+        run_orb_options()
+        log.info("Single-run complete")
+    else:
+        log.info(f"Loop mode — checking every {args.interval // 60}m until {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET (use --once to run a single check)")
+        while True:
+            now_et = datetime.now(ET)
+            now_t  = now_et.time()
+
+            if now_t < MARKET_OPEN:
+                wait_secs = int(
+                    (datetime.combine(now_et.date(), MARKET_OPEN).replace(tzinfo=ET) - now_et)
+                    .total_seconds()
+                )
+                log.info(f"Pre-market ({now_t.strftime('%H:%M')} ET) — waiting {wait_secs // 60}m for 9:30 open")
+                _time.sleep(min(wait_secs + 5, args.interval))
+                continue
+
+            if now_t >= MARKET_CLOSE:
+                log.info(f"Past {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET — session complete, exiting")
+                break
+
+            run_orb_options()
+            log.info(f"Cycle complete — next check in {args.interval // 60}m")
+            _time.sleep(args.interval)
