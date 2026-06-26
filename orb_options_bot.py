@@ -276,6 +276,50 @@ def classify_holding(positions: list) -> str:
     return "unknown"
 
 
+def _close_stale_options() -> None:
+    """
+    Close options legs that have no matching equity BUY order from today.
+    Safety net for missed EOD closes — runs on every bot execution before
+    the market-hours check so overnight holds are caught the next morning.
+    """
+    today_start = get_now_et().replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        all_pos = trading_client.get_all_positions()
+        options_legs = [p for p in all_pos if p.asset_class == AssetClass.US_OPTION]
+    except Exception as e:
+        log.error(f"_close_stale_options: could not fetch positions — {e}")
+        return
+
+    if not options_legs:
+        return
+
+    # Extract the underlying symbol from an option symbol like "AAPL260627C00200000"
+    underlying_re = re.compile(r"^([A-Z]+)\d")
+
+    for leg in options_legs:
+        m = underlying_re.match(leg.symbol)
+        if not m:
+            continue
+        underlying = m.group(1)
+        try:
+            orders = trading_client.get_orders(filter=GetOrdersRequest(
+                status=QueryOrderStatus.FILLED,
+                after=today_start,
+                symbols=[underlying],
+            ))
+            entered_today = any(o.side == OrderSide.BUY for o in orders)
+        except Exception:
+            entered_today = True   # fail-safe: don't close if check errors
+
+        if not entered_today:
+            log.warning(
+                f"STALE OPTIONS LEG {leg.symbol} (underlying {underlying})"
+                f" | Unrealised P&L: ${float(leg.unrealized_pl):+.2f}"
+                f" | Entered before today — force closing"
+            )
+            close_all_legs([leg])
+
+
 def close_all_legs(positions: list) -> None:
     """
     Close all legs with two fixes:
@@ -928,6 +972,15 @@ def manage_existing_options_positions(underlying_symbol: str, positions: list, s
 # ---------------------------------------------------------------------------
 
 def run_orb_options() -> None:
+    now_et = get_now_et()
+    log.info(f"--- ORB Options check at {now_et.strftime('%H:%M')} ET ---")
+
+    # Safety net: close any stale options legs from a previous session.
+    # Runs before the market-closed check so a missed EOD close is caught
+    # the next morning even when the market is not yet open.
+    if not DRY_RUN:
+        _close_stale_options()
+
     if not DRY_RUN and not trading_client.get_clock().is_open:
         log.info("Market closed — skipping run")
         return
@@ -937,9 +990,6 @@ def run_orb_options() -> None:
         return
 
     _block_new_entries = not DRY_RUN and not check_risk_limits()
-
-    now_et = get_now_et()
-    log.info(f"--- ORB Options check at {now_et.strftime('%H:%M')} ET ---")
 
     # Hard EOD sweep — close all options legs directly from positions list,
     # no bar data needed. Prevents overnight holds even if bar fetch fails.
@@ -1040,27 +1090,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Log strategy selection and leg structure without submitting any orders",
     )
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Run a single check and exit (default is to loop every 5 minutes until market close)",
-    )
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=300,
-        metavar="SECONDS",
-        help="Loop interval in seconds (default: 300 = 5 minutes)",
-    )
     args = parser.parse_args()
     DRY_RUN = args.dry_run
 
     if DRY_RUN:
         log.info("*** DRY RUN MODE — no orders will be submitted ***")
-
-    ET = ZoneInfo("America/New_York")
-    MARKET_OPEN  = time(9, 30)
-    MARKET_CLOSE = time(ORB_CLOSE_HOUR, ORB_CLOSE_MINUTE)
 
     log.info("ORB Options Bot starting")
     log.info(
@@ -1074,28 +1108,5 @@ if __name__ == "__main__":
         f" | daily loss limit {DAILY_LOSS_LIMIT_PCT:.0%}"
     )
 
-    if args.once:
-        run_orb_options()
-        log.info("Single-run complete")
-    else:
-        log.info(f"Loop mode — checking every {args.interval // 60}m until {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET (use --once to run a single check)")
-        while True:
-            now_et = datetime.now(ET)
-            now_t  = now_et.time()
-
-            if now_t < MARKET_OPEN:
-                wait_secs = int(
-                    (datetime.combine(now_et.date(), MARKET_OPEN).replace(tzinfo=ET) - now_et)
-                    .total_seconds()
-                )
-                log.info(f"Pre-market ({now_t.strftime('%H:%M')} ET) — waiting {wait_secs // 60}m for 9:30 open")
-                _time.sleep(min(wait_secs + 5, args.interval))
-                continue
-
-            if now_t >= MARKET_CLOSE:
-                log.info(f"Past {ORB_CLOSE_HOUR}:{ORB_CLOSE_MINUTE:02d} ET — session complete, exiting")
-                break
-
-            run_orb_options()
-            log.info(f"Cycle complete — next check in {args.interval // 60}m")
-            _time.sleep(args.interval)
+    run_orb_options()
+    log.info("Run complete")
