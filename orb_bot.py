@@ -31,14 +31,17 @@ from dotenv import load_dotenv
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, AssetClass
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus, AssetClass, PositionSide
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from config import (
+    DAILY_LOSS_LIMIT_PCT,
+    MAX_TOTAL_INVESTMENT,
     ORB_CLOSE_HOUR,
     ORB_CLOSE_MINUTE,
+    ORB_EQUITY_BLOCKLIST,
     ORB_MIN_OR_PCT,
     ORB_POSITION_SIZE,
     ORB_PROFIT_MULTIPLIER,
@@ -47,7 +50,6 @@ from config import (
     ORB_STOP_BUFFER,
     ORB_VOLUME_FACTOR,
     MAX_TOTAL_INVESTMENT,
-    DAILY_LOSS_LIMIT_PCT,
 )
 from screener import get_active_symbols
 
@@ -138,6 +140,66 @@ def already_traded_today(symbol: str) -> bool:
     except Exception as e:
         log.warning(f"{symbol}: could not check today's orders — {e}")
         return False
+
+
+def _was_entered_today(symbol: str) -> bool:
+    """True if a BUY was filled for this symbol during today's session."""
+    today_start = get_now_et().replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        orders = trading_client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.FILLED,
+            after=today_start,
+            symbols=[symbol],
+        ))
+        return any(o.side == OrderSide.BUY for o in orders)
+    except Exception:
+        return True   # fail-safe: don't close if the check itself errors
+
+
+def close_stale_positions() -> int:
+    """
+    Close every equity position that has no BUY order from today's session.
+
+    This is the safety net for missed EOD closes (GitHub Actions delay/skip).
+    Called unconditionally at the top of every run — even when the market is
+    closed — so a position stranded overnight gets cleaned up the next morning.
+
+    Returns the number of stale positions closed.
+    """
+    closed = 0
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as e:
+        log.error(f"close_stale_positions: could not fetch positions — {e}")
+        return 0
+
+    for pos in positions:
+        if pos.asset_class != AssetClass.US_EQUITY:
+            continue
+        sym = pos.symbol
+        if _was_entered_today(sym):
+            continue   # opened today — normal in-session position, leave it alone
+
+        qty        = abs(int(float(pos.qty)))
+        unreal_pl  = float(pos.unrealized_pl)
+        close_side = OrderSide.SELL if pos.side == PositionSide.LONG else OrderSide.BUY
+        log.warning(
+            f"STALE POSITION {sym} × {qty}"
+            f" | Unrealised P&L: ${unreal_pl:+.2f}"
+            f" | Entered before today — force closing now"
+        )
+        try:
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=sym, qty=qty,
+                side=close_side,
+                time_in_force=TimeInForce.DAY,
+            ))
+            log.info(f"STALE CLOSE — {sym} × {qty}")
+            closed += 1
+        except Exception as e:
+            log.error(f"Stale close failed for {sym}: {e}")
+
+    return closed
 
 
 def get_position(symbol: str):
@@ -311,12 +373,20 @@ def process_symbol(symbol: str, spy_bullish: bool | None, spy_trend_pct: float,
 # ---------------------------------------------------------------------------
 
 def run_orb() -> None:
+    now_et = get_now_et()
+    log.info(f"--- ORB check at {now_et.strftime('%H:%M')} ET ---")
+
+    # ── Safety net: close stale positions from previous sessions ────────────
+    # Runs unconditionally before any market-hours check.
+    # If yesterday's EOD close was missed (GitHub Actions delay/skip), this
+    # detects positions with no today BUY order and closes them immediately.
+    stale_closed = close_stale_positions()
+    if stale_closed:
+        log.warning(f"Stale cleanup closed {stale_closed} position(s) from previous session(s)")
+
     if not trading_client.get_clock().is_open:
         log.info("Market closed — skipping run")
         return
-
-    now_et = get_now_et()
-    log.info(f"--- ORB check at {now_et.strftime('%H:%M')} ET ---")
 
     # Daily loss circuit-breaker (from QuantTrading risk_engine.py)
     # Blocks new entries; existing positions are still managed below.
@@ -392,7 +462,11 @@ def run_orb() -> None:
         log.info("Skipping new entries — daily loss limit active")
         return
 
-    active_symbols = get_active_symbols()
+    raw_symbols    = get_active_symbols()
+    active_symbols = [s for s in raw_symbols if s not in ORB_EQUITY_BLOCKLIST]
+    blocked        = [s for s in raw_symbols if s in ORB_EQUITY_BLOCKLIST]
+    if blocked:
+        log.info(f"Screener blocklist removed: {', '.join(blocked)}")
     if not active_symbols:
         log.warning("No active symbols found from screener. Skipping new entries.")
     else:
