@@ -1,23 +1,31 @@
 """
-IV Calculator — Newton-Raphson IV solver, IV Rank, and IV Skew.
+IV Calculator — American option IV solver, IV Rank, IV Skew, and Delta.
 
-Methodology adapted from:
-  github.com/EthanFalcao/Defi_Options_Implied_Volatility (vs.py / cboe_vs.py)
-
-Applied to US equity options via yfinance chains + Alpaca bar data.
+IV computation uses the Bjerksund-Stensland (2002) American-option pricer
+from optlib (dbrojas/optlib, ml/gbs.py). This correctly accounts for the
+early exercise premium in US equity options — the old Black-Scholes NR solver
+used the European formula, which understates IV on puts and deep-ITM options.
 
 Public API
 ----------
-    compute_iv(market_price, S, K, T, r, option_type)  -> float | None
+    compute_iv(market_price, S, K, T, r, option_type)  -> float | None   (legacy BS, kept as fallback)
+    compute_american_iv(market_price, S, K, T, r, option_type, q) -> float | None
+    compute_american_delta(S, K, T, r, iv, option_type, q)        -> float | None
     compute_iv_rank(symbol, current_iv)                -> float   (0–100)
     compute_iv_skew(calls, puts, current_price)        -> float   (signed)
-    enrich_chain(calls, puts, S, T, r)                 -> (calls, puts)
+    enrich_chain(calls, puts, S, T, r)                 -> (calls, puts)  adds amer_iv + delta cols
 """
 import math
 from functools import lru_cache
 
 import pandas as pd
 import yfinance as yf
+
+try:
+    from .gbs import american as _gbs_american, amer_implied_vol as _gbs_amer_iv
+    _GBS_AVAILABLE = True
+except ImportError:
+    _GBS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -101,6 +109,73 @@ def compute_iv(
         if sigma > 20.0:
             return None                 # diverged
     return sigma                        # return best estimate after max_iter
+
+
+# ---------------------------------------------------------------------------
+# American option IV + delta (Bjerksund-Stensland 2002 via ml/gbs.py)
+# ---------------------------------------------------------------------------
+
+def compute_american_iv(
+    market_price: float,
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    option_type: str,   # "call" or "put"
+    q: float = 0.0,     # continuous dividend yield
+) -> float | None:
+    """
+    American-option implied volatility via bisection on the B-S 2002 pricer.
+
+    Uses amer_implied_vol() from ml/gbs.py (optlib). Unlike Newton-Raphson,
+    bisection doesn't rely on vega, so it's more robust for deep ITM puts
+    where vega is near zero and the European formula understates early-exercise value.
+
+    Falls back to European NR (compute_iv) when ml/gbs.py is not available.
+    Returns None on invalid inputs or convergence failure.
+    """
+    if market_price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return None
+    if not _GBS_AVAILABLE:
+        return compute_iv(market_price, S, K, T, r, option_type)
+    opt_type = "c" if option_type == "call" else "p"
+    try:
+        iv = _gbs_amer_iv(opt_type, S, K, T, r, q, market_price)
+        return float(iv) if iv and iv > 0 else None
+    except Exception:
+        return compute_iv(market_price, S, K, T, r, option_type)
+
+
+def compute_american_delta(
+    S: float,
+    K: float,
+    T: float,
+    r: float,
+    iv: float,
+    option_type: str,   # "call" or "put"
+    q: float = 0.0,
+) -> float | None:
+    """
+    Delta from the Bjerksund-Stensland American-option pricer.
+
+    Returns [1] element from american() — the partial derivative dV/dS.
+    For calls: 0 < delta < 1  (higher = more ITM, higher probability of expiry ITM)
+    For puts:  -1 < delta < 0 (more negative = more ITM)
+
+    delta ≈ 0.15 call / -0.15 put → ~15% chance of expiring ITM → useful for
+    Iron Condor short-strike selection (e.g. IC_SHORT_DELTA = 0.15).
+
+    Returns None when ml/gbs.py is unavailable or pricing fails.
+    """
+    if not _GBS_AVAILABLE or iv is None or iv <= 0 or T <= 0 or S <= 0 or K <= 0:
+        return None
+    opt_type = "c" if option_type == "call" else "p"
+    try:
+        result = _gbs_american(opt_type, S, K, T, r, q, iv)
+        delta = float(result[1])
+        return delta if math.isfinite(delta) else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +272,7 @@ def compute_iv_skew(
 
 
 # ---------------------------------------------------------------------------
-# Chain enrichment — replace yfinance IV with NR-computed IV
+# Chain enrichment — add amer_iv and delta columns
 # ---------------------------------------------------------------------------
 
 def enrich_chain(
@@ -206,22 +281,44 @@ def enrich_chain(
     S: float,
     T: float,
     r: float = _RISK_FREE,
+    q: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Add a 'nr_iv' column to both DataFrames containing Newton-Raphson IV
-    computed from the bid-ask midpoint.  Falls back to yfinance's
-    impliedVolatility when NR fails to converge.
+    Add 'amer_iv' and 'delta' columns to both DataFrames.
+
+    amer_iv  — American IV via Bjerksund-Stensland bisection (ml/gbs.py).
+               More accurate than Black-Scholes NR for puts and deep-ITM calls
+               because it accounts for early exercise premium.
+               Falls back to NR / yfinance IV when gbs.py is unavailable.
+
+    delta    — dV/dS from the American pricer (range: call 0–1, put -1 to 0).
+               Useful for delta-based Iron Condor strike selection, where
+               abs(delta) ≤ IC_SHORT_DELTA (e.g. 0.15) means ~85% OTM probability.
+
+    Legacy nr_iv column is also populated for backward compatibility.
     """
-    def _iv_row(row: pd.Series, kind: str) -> float:
+    def _enrich_row(row: pd.Series, kind: str) -> dict:
+        K   = float(row["strike"])
         mid = (float(row.get("bid", 0)) + float(row.get("ask", 0))) / 2.0
-        iv  = compute_iv(mid, S, float(row["strike"]), T, r, kind)
-        if iv is None or iv <= 0:
-            # Fall back to yfinance value
-            return float(row.get("impliedVolatility", 0.30))
-        return iv
+
+        # American IV (preferred)
+        amer_iv = compute_american_iv(mid, S, K, T, r, kind, q)
+        if amer_iv is None or amer_iv <= 0:
+            # NR fallback, then yfinance
+            nr = compute_iv(mid, S, K, T, r, kind)
+            amer_iv = nr if (nr and nr > 0) else float(row.get("impliedVolatility", 0.30))
+
+        delta = compute_american_delta(S, K, T, r, amer_iv, kind, q)
+
+        return {"amer_iv": amer_iv, "nr_iv": amer_iv, "delta": delta}
 
     calls = calls.copy()
     puts  = puts.copy()
-    calls["nr_iv"] = calls.apply(lambda r: _iv_row(r, "call"), axis=1)
-    puts["nr_iv"]  = puts.apply(lambda r: _iv_row(r, "put"),  axis=1)
+
+    call_enriched = calls.apply(lambda row: pd.Series(_enrich_row(row, "call")), axis=1)
+    put_enriched  = puts.apply(lambda row: pd.Series(_enrich_row(row, "put")),  axis=1)
+
+    calls[["amer_iv", "nr_iv", "delta"]] = call_enriched
+    puts[["amer_iv",  "nr_iv", "delta"]] = put_enriched
+
     return calls, puts

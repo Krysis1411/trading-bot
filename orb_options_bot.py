@@ -41,6 +41,7 @@ from config import (
     MIN_UNDERLYING_PRICE,
     IC_MIN_CREDIT_RATIO,
     IC_SIGMA_MULTIPLE,
+    IC_SHORT_DELTA,
     IC_PROFIT_TARGET_PCT,
     IC_PNL_STOP_MULTIPLE,
     ORB_OPTIONS_BLOCKLIST,
@@ -562,9 +563,11 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
     atm_call = calls_sorted.iloc[0]
     atm_put  = puts_sorted.iloc[0]
 
-    # Use NR-computed IV; fall back to yfinance if NR column missing
-    avg_atm_iv = (float(atm_call.get('nr_iv', atm_call['impliedVolatility'])) +
-                  float(atm_put.get('nr_iv',  atm_put['impliedVolatility']))) / 2
+    # Use American IV (amer_iv); fall back to nr_iv → yfinance if missing
+    avg_atm_iv = (
+        float(atm_call.get('amer_iv', atm_call.get('nr_iv', atm_call['impliedVolatility']))) +
+        float(atm_put.get('amer_iv',  atm_put.get('nr_iv',  atm_put['impliedVolatility'])))
+    ) / 2
 
     # IV Rank (0–100): where current IV sits in the symbol's 1-year range
     iv_rank = compute_iv_rank(symbol, avg_atm_iv)
@@ -657,24 +660,44 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
         strategy = "Iron Condor"
         width = 5.0 if current_price > 100 else (2.0 if current_price > 50 else 1.0)
 
-        # Gate 2: sigma-based strike placement
+        # Gate 2: delta-based strike placement (falls back to sigma-multiple)
         holding_days = max(1, dte + 1)
         expected_move = current_price * avg_atm_iv * math.sqrt(holding_days / 252)
         min_call_strike = current_price + IC_SIGMA_MULTIPLE * expected_move
         max_put_strike  = current_price - IC_SIGMA_MULTIPLE * expected_move
-        log.info(
-            f"{symbol} | IC expected move: ${expected_move:.2f} over {holding_days}d "
-            f"| min call strike: ${min_call_strike:.2f} | max put strike: ${max_put_strike:.2f}"
-        )
 
-        sc_target = max(or_high, min_call_strike)
-        sc_candidates = calls[calls['strike'] >= sc_target]
-        if sc_candidates.empty:
-            sc_candidates = calls[calls['strike'] > current_price]
-        if sc_candidates.empty:
-            log.warning(f"{symbol} | IC rejected: no short call candidates above ${sc_target:.2f}")
-            return False
-        short_call = sc_candidates.iloc[(sc_candidates['strike'] - sc_target).abs().argsort()].iloc[0]
+        has_delta = 'delta' in calls.columns and calls['delta'].notna().any()
+
+        if has_delta:
+            # Prefer delta-based selection: short call where 0 < delta ≤ IC_SHORT_DELTA
+            # above OR high, pick highest delta (closest to ATM = most premium).
+            delta_calls = calls[
+                (calls['strike'] >= or_high) &
+                (calls['delta'] > 0) &
+                (calls['delta'] <= IC_SHORT_DELTA)
+            ]
+            if not delta_calls.empty:
+                short_call = delta_calls.loc[delta_calls['delta'].idxmax()]
+                log.info(
+                    f"{symbol} | IC short call: strike ${short_call['strike']:.2f} "
+                    f"delta={float(short_call['delta']):.3f} (target ≤ {IC_SHORT_DELTA})"
+                )
+            else:
+                has_delta = False  # fall through to sigma logic
+
+        if not has_delta:
+            sc_target = max(or_high, min_call_strike)
+            sc_candidates = calls[calls['strike'] >= sc_target]
+            if sc_candidates.empty:
+                sc_candidates = calls[calls['strike'] > current_price]
+            if sc_candidates.empty:
+                log.warning(f"{symbol} | IC rejected: no short call candidates above ${sc_target:.2f}")
+                return False
+            short_call = sc_candidates.iloc[(sc_candidates['strike'] - sc_target).abs().argsort()].iloc[0]
+            log.info(
+                f"{symbol} | IC expected move: ${expected_move:.2f} over {holding_days}d "
+                f"| short call: ${short_call['strike']:.2f} (σ-fallback)"
+            )
 
         lc_candidates = calls[calls['strike'] > short_call['strike']]
         if lc_candidates.empty:
@@ -682,14 +705,34 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
             return False
         long_call = lc_candidates.iloc[(lc_candidates['strike'] - (short_call['strike'] + width)).abs().argsort()].iloc[0]
 
-        sp_target = min(or_low, max_put_strike)
-        sp_candidates = puts[puts['strike'] <= sp_target]
-        if sp_candidates.empty:
-            sp_candidates = puts[puts['strike'] < current_price]
-        if sp_candidates.empty:
-            log.warning(f"{symbol} | IC rejected: no short put candidates below ${sp_target:.2f}")
-            return False
-        short_put = sp_candidates.iloc[(sp_candidates['strike'] - sp_target).abs().argsort()].iloc[0]
+        # Short put: -IC_SHORT_DELTA ≤ delta < 0, below OR low; pick most negative delta (closest to threshold).
+        has_put_delta = 'delta' in puts.columns and puts['delta'].notna().any()
+
+        if has_put_delta:
+            delta_puts = puts[
+                (puts['strike'] <= or_low) &
+                (puts['delta'] < 0) &
+                (puts['delta'] >= -IC_SHORT_DELTA)
+            ]
+            if not delta_puts.empty:
+                short_put = delta_puts.loc[delta_puts['delta'].idxmin()]
+                log.info(
+                    f"{symbol} | IC short put: strike ${short_put['strike']:.2f} "
+                    f"delta={float(short_put['delta']):.3f} (target ≥ -{IC_SHORT_DELTA})"
+                )
+            else:
+                has_put_delta = False
+
+        if not has_put_delta:
+            sp_target = min(or_low, max_put_strike)
+            sp_candidates = puts[puts['strike'] <= sp_target]
+            if sp_candidates.empty:
+                sp_candidates = puts[puts['strike'] < current_price]
+            if sp_candidates.empty:
+                log.warning(f"{symbol} | IC rejected: no short put candidates below ${sp_target:.2f}")
+                return False
+            short_put = sp_candidates.iloc[(sp_candidates['strike'] - sp_target).abs().argsort()].iloc[0]
+            log.info(f"{symbol} | IC short put: ${short_put['strike']:.2f} (σ-fallback)")
 
         lp_candidates = puts[puts['strike'] < short_put['strike']]
         if lp_candidates.empty:
@@ -1104,7 +1147,7 @@ if __name__ == "__main__":
     )
     log.info(
         f"Filters: price≥${MIN_UNDERLYING_PRICE:.0f} | credit≥{IC_MIN_CREDIT_RATIO:.0%}"
-        f" | {IC_SIGMA_MULTIPLE}σ strikes | min breakout {MIN_BREAKOUT_STRENGTH_PCT:.1%}"
+        f" | delta≤{IC_SHORT_DELTA} strikes (σ={IC_SIGMA_MULTIPLE} fallback) | min breakout {MIN_BREAKOUT_STRENGTH_PCT:.1%}"
         f" | daily loss limit {DAILY_LOSS_LIMIT_PCT:.0%}"
     )
 
