@@ -10,3 +10,8 @@ pyotp>=2.9.0
 logzero>=1.7.0
 websocket-client>=1.6.0
 
+# India ORB bot — analytics & data
+ta>=0.11.0
+jugaad-data>=2.6
+quantstats-lumi>=0.3.3
+
