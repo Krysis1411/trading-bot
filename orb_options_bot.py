@@ -15,7 +15,7 @@ import pandas as pd
 from dotenv import load_dotenv
 
 import yfinance as yf
-from ml.iv_calculator import compute_iv_rank, compute_iv_skew, enrich_chain
+from ml.iv_calculator import compute_iv_rank, compute_iv_skew, enrich_chain, compute_oi_features
 from ml.regime_detector import RegimeResult, daily_trend, detect_regime
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest, OptionLegRequest
@@ -42,6 +42,7 @@ from config import (
     IC_MIN_CREDIT_RATIO,
     IC_SIGMA_MULTIPLE,
     IC_SHORT_DELTA,
+    IC_MAX_PCR_ATM,
     IC_PROFIT_TARGET_PCT,
     IC_PNL_STOP_MULTIPLE,
     ORB_OPTIONS_BLOCKLIST,
@@ -551,10 +552,13 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
         log.warning(f"{symbol} | Missing Call or Put contracts for expiry {nearest_expiry}")
         return False
 
-    # Enrich chain with Newton-Raphson IV (more accurate than yfinance's stale column)
-    T_years = (date.fromisoformat(nearest_expiry) - date.today()).days / 365.0
-    T_years = max(T_years, 1 / (252 * 6.5))   # floor at one 5-min bar
+    # Enrich chain with American IV + delta (Bjerksund-Stensland via ml/gbs.py)
+    dte_days = (date.fromisoformat(nearest_expiry) - date.today()).days
+    T_years = max(dte_days / 365.0, 1 / (252 * 6.5))   # floor at one 5-min bar
     calls, puts = enrich_chain(calls, puts, current_price, T_years)
+
+    # OI-derived features (AI-trader: option_chain_features.py)
+    oi_feats = compute_oi_features(calls, puts, current_price, dte_days)
 
     # Sort strikes by closeness to current price to find ATM contracts
     calls_sorted = calls.iloc[(calls['strike'] - current_price).abs().argsort()]
@@ -591,6 +595,13 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
     log.info(f"{symbol} | ATM Put: {atm_put['contractSymbol']} (Strike: {atm_put['strike']} | Ask: {atm_put['ask']})")
     log.info(f"{symbol} | ATM IV: {avg_atm_iv:.2%} | IV Rank: {iv_rank:.0f}/100 | Skew: {iv_skew:+.3f}")
     log.info(f"{symbol} | Regime: {regime_label} | Daily trend: {stock_daily_trend}")
+    log.info(
+        f"{symbol} | OI: PCR={oi_feats.get('pcr_atm', 0):.2f}"
+        f" | call_grad={oi_feats.get('call_oi_grad', 0):.2f}"
+        f" | put_grad={oi_feats.get('put_oi_grad', 0):.2f}"
+        f" | conc={oi_feats.get('oi_concentration', 0):.1%}"
+        f" | θ-press=${oi_feats.get('theta_pressure', 0):.2f}/day"
+    )
 
     # CRISIS regime: skip new entries (QuantTrading: "crisis always wins")
     if regime_label == "CRISIS":
@@ -649,7 +660,7 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
     # ── Iron Condor ───────────────────────────────────────────────────────────
     if situation == MarketSituation.PREMIUM_SELL:
         # Gate 1: DTE limit
-        dte = (date.fromisoformat(nearest_expiry) - date.today()).days
+        dte = dte_days
         if dte > IC_MAX_DTE:
             log.info(
                 f"{symbol} | IC rejected: DTE={dte} > IC_MAX_DTE={IC_MAX_DTE} "
@@ -659,6 +670,17 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
 
         strategy = "Iron Condor"
         width = 5.0 if current_price > 100 else (2.0 if current_price > 50 else 1.0)
+
+        # Gate 1b: PCR gate — skip IC when OI is directionally skewed
+        # A PCR > IC_MAX_PCR_ATM means put OI heavily dominates near ATM →
+        # the market is leaning bearish, making a neutral condor risky on the put side.
+        pcr = oi_feats.get("pcr_atm", 1.0)
+        if pcr > IC_MAX_PCR_ATM:
+            log.info(
+                f"{symbol} | IC rejected: PCR={pcr:.2f} > {IC_MAX_PCR_ATM} "
+                "(bearish OI skew too strong for neutral condor)"
+            )
+            return False
 
         # Gate 2: delta-based strike placement (falls back to sigma-multiple)
         holding_days = max(1, dte + 1)

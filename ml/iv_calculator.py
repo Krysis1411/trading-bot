@@ -322,3 +322,104 @@ def enrich_chain(
     puts[["amer_iv",  "nr_iv", "delta"]] = put_enriched
 
     return calls, puts
+
+
+# ---------------------------------------------------------------------------
+# OI-derived chain features (from aaryansinha16/AI-trader option_chain_features.py)
+# ---------------------------------------------------------------------------
+
+def compute_oi_features(
+    calls: pd.DataFrame,
+    puts: pd.DataFrame,
+    current_price: float,
+    dte: int,
+    n_atm: int = 3,
+) -> dict:
+    """
+    Open-interest features that complement IV rank for Iron Condor entry quality.
+
+    pcr_atm        : put/call OI ratio within ±n_atm strikes of ATM.
+                     > 1 = put-heavy (bearish lean) | < 1 = call-heavy (bullish lean)
+                     Extreme values indicate directional bias — bad for neutral IC.
+    call_oi_grad   : normalized OI slope across OTM call strikes (polyfit deg-1).
+                     High positive = heavy call wall above price (resistance belt).
+    put_oi_grad    : normalized OI slope across OTM put strikes.
+                     High negative = heavy put wall below price (support belt).
+    oi_concentration : top-3 OI strikes as fraction of total chain OI.
+                       High = strong magnet levels | Low = diffuse, less predictive.
+    theta_pressure : ATM straddle mid-price / max(DTE, 1) — daily premium budget.
+                     Higher = richer sell environment for IC credit.
+    """
+    import numpy as np
+
+    result = {
+        "pcr_atm": 1.0,
+        "call_oi_grad": 0.0,
+        "put_oi_grad": 0.0,
+        "oi_concentration": 0.0,
+        "theta_pressure": 0.0,
+    }
+
+    if "openInterest" not in calls.columns or "openInterest" not in puts.columns:
+        return result
+
+    try:
+        # PCR near ATM (±n_atm closest strikes)
+        atm_c_idx = (calls["strike"] - current_price).abs().argsort().values[:n_atm * 2 + 1]
+        atm_p_idx = (puts["strike"]  - current_price).abs().argsort().values[:n_atm * 2 + 1]
+        call_oi = calls.iloc[atm_c_idx]["openInterest"].astype(float).fillna(0).sum()
+        put_oi  = puts.iloc[atm_p_idx]["openInterest"].astype(float).fillna(0).sum()
+        result["pcr_atm"] = put_oi / call_oi if call_oi > 0 else 1.0
+    except Exception:
+        pass
+
+    try:
+        # Call-side OI gradient (OTM calls, sorted ascending by strike)
+        otm_calls = calls[calls["strike"] > current_price].sort_values("strike")
+        if len(otm_calls) >= 3:
+            x = otm_calls["strike"].values.astype(float)
+            y = otm_calls["openInterest"].astype(float).fillna(0).values
+            slope = np.polyfit(x - x.mean(), y, 1)[0]
+            result["call_oi_grad"] = float(slope / (y.mean() + 1e-9))
+    except Exception:
+        pass
+
+    try:
+        # Put-side OI gradient (OTM puts, sorted descending by strike)
+        otm_puts = puts[puts["strike"] < current_price].sort_values("strike", ascending=False)
+        if len(otm_puts) >= 3:
+            x = otm_puts["strike"].values.astype(float)
+            y = otm_puts["openInterest"].astype(float).fillna(0).values
+            slope = np.polyfit(x - x.mean(), y, 1)[0]
+            result["put_oi_grad"] = float(slope / (y.mean() + 1e-9))
+    except Exception:
+        pass
+
+    try:
+        # OI concentration: top-3 strike levels as % of total chain OI
+        all_oi = (
+            pd.concat([
+                calls[["strike", "openInterest"]],
+                puts[["strike", "openInterest"]],
+            ])
+            .assign(openInterest=lambda d: d["openInterest"].astype(float).fillna(0))
+            .groupby("strike")["openInterest"].sum()
+            .sort_values(ascending=False)
+        )
+        total_oi = float(all_oi.sum())
+        if total_oi > 0:
+            result["oi_concentration"] = float(all_oi.iloc[:3].sum() / total_oi)
+    except Exception:
+        pass
+
+    try:
+        # Theta pressure: ATM straddle mid / max(DTE, 1)
+        atm_call = calls.iloc[(calls["strike"] - current_price).abs().argsort().values[0]]
+        atm_put  = puts.iloc[(puts["strike"]  - current_price).abs().argsort().values[0]]
+        call_mid = (float(atm_call.get("bid", 0)) + float(atm_call.get("ask", 0))) / 2
+        put_mid  = (float(atm_put.get("bid", 0))  + float(atm_put.get("ask", 0)))  / 2
+        result["theta_pressure"] = (call_mid + put_mid) / max(dte, 1)
+    except Exception:
+        pass
+
+    return result

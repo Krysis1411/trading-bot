@@ -53,6 +53,7 @@ from config import (
     MAX_TOTAL_INVESTMENT,
     ORB_DUAL_THRUST_DAYS,
     ORB_DUAL_THRUST_MAX_MULTIPLE,
+    ORB_ATR_REGIME_HIGH_PCT,
 )
 from screener import get_active_symbols
 
@@ -253,6 +254,47 @@ def get_position(symbol: str):
         return trading_client.get_open_position(symbol)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# ATR-percentile volatility regime (AI-trader regime_detector.py)
+# ---------------------------------------------------------------------------
+
+def get_spy_atr_regime() -> str:
+    """
+    Return "HIGH", "NORMAL", or "LOW" based on where SPY's current ATR-14
+    sits within its 1-year percentile distribution.
+
+    HIGH (≥ 75th pct): chaotic opens → ORB breakouts breach and reverse more.
+    LOW  (≤ 25th pct): too tight → OR range tiny, targets unreachable.
+    NORMAL: proceed as usual.
+
+    Uses daily bars so the regime is stable for the full session.
+    Returns "NORMAL" on any data failure so the bot never silently stops trading.
+    """
+    try:
+        hist = yf.Ticker("SPY").history(period="1y", interval="1d", auto_adjust=True)
+        if len(hist) < 20:
+            return "NORMAL"
+        prev_close = hist["Close"].shift(1)
+        tr = pd.concat([
+            hist["High"] - hist["Low"],
+            (hist["High"] - prev_close).abs(),
+            (hist["Low"]  - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(14).mean().dropna()
+        if atr.empty:
+            return "NORMAL"
+        current_atr = float(atr.iloc[-1])
+        pct_high = float(atr.quantile(ORB_ATR_REGIME_HIGH_PCT / 100))
+        pct_low  = float(atr.quantile(1 - ORB_ATR_REGIME_HIGH_PCT / 100))
+        if current_atr >= pct_high:
+            return "HIGH"
+        if current_atr <= pct_low:
+            return "LOW"
+        return "NORMAL"
+    except Exception:
+        return "NORMAL"
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +557,15 @@ def run_orb() -> None:
     # -----------------------------------------------------------------------
     if _block_new_entries:
         log.info("Skipping new entries — daily loss limit active")
+        return
+
+    # ATR regime gate: suppress new entries on HIGH-volatility SPY days.
+    # ORB breakouts fail more when the overall market is chaotic — OR range
+    # gets breached in both directions before a clean trend develops.
+    spy_regime = get_spy_atr_regime()
+    log.info(f"SPY ATR regime: {spy_regime} (threshold: {ORB_ATR_REGIME_HIGH_PCT}th percentile)")
+    if spy_regime == "HIGH":
+        log.warning("SPY in HIGH ATR regime — suppressing new ORB entries this session")
         return
 
     raw_symbols    = get_active_symbols()
