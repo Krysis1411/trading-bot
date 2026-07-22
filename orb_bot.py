@@ -27,6 +27,7 @@ from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import yfinance as yf
 from dotenv import load_dotenv
 
 from alpaca.trading.client import TradingClient
@@ -50,6 +51,8 @@ from config import (
     ORB_STOP_BUFFER,
     ORB_VOLUME_FACTOR,
     MAX_TOTAL_INVESTMENT,
+    ORB_DUAL_THRUST_DAYS,
+    ORB_DUAL_THRUST_MAX_MULTIPLE,
 )
 from screener import get_active_symbols
 
@@ -80,6 +83,49 @@ data_client = StockHistoricalDataClient(_key, _secret)
 
 ET = ZoneInfo("America/New_York")
 CLOSE_TIME = time(ORB_CLOSE_HOUR, ORB_CLOSE_MINUTE)
+
+# Dual Thrust expected-range cache — computed once per symbol per session from yfinance.
+# Avoids re-fetching on every 5-min cron cycle.
+_dt_cache: dict[str, float | None] = {}
+
+
+# ---------------------------------------------------------------------------
+# Dual Thrust expected-range helper
+# ---------------------------------------------------------------------------
+
+def compute_dual_thrust_range(symbol: str, n_days: int = ORB_DUAL_THRUST_DAYS) -> float | None:
+    """
+    Dual Thrust expected daily range over the prior n_days complete sessions.
+
+    Formula (from je-suis-tm/quant-trading):
+        range = max(HH − LC,  HC − LL)
+        HH = highest high | LL = lowest low | HC = highest close | LC = lowest close
+
+    Used as a pre-entry gate: if today's opening range > MULT × this value, the
+    day is a gap/news day where the OR is already exhausted — skip the trade.
+
+    Returns None when price data is unavailable (bot proceeds without the filter).
+    """
+    if symbol in _dt_cache:
+        return _dt_cache[symbol]
+    try:
+        hist = yf.Ticker(symbol).history(period=f"{n_days + 5}d", interval="1d", auto_adjust=True)
+        if len(hist) > 1:
+            hist = hist.iloc[:-1]   # drop today's potentially-partial bar
+        hist = hist.tail(n_days)
+        if len(hist) < n_days:
+            _dt_cache[symbol] = None
+            return None
+        hh = float(hist["High"].max())
+        ll = float(hist["Low"].min())
+        hc = float(hist["Close"].max())
+        lc = float(hist["Close"].min())
+        dt_range = max(hh - lc, hc - ll)
+        _dt_cache[symbol] = dt_range
+        return dt_range
+    except Exception:
+        _dt_cache[symbol] = None
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +298,15 @@ def process_symbol(symbol: str, spy_bullish: bool | None, spy_trend_pct: float,
     # Improvement 2: skip narrow opening ranges
     if ORB_MIN_OR_PCT > 0 and or_range / or_high < ORB_MIN_OR_PCT:
         log.info(f"{symbol}: OR too narrow ({or_range / or_high:.3%} < {ORB_MIN_OR_PCT:.1%}) — skipping")
+        return False
+
+    # Dual Thrust gate: skip if OR is wider than expected (gap/news/exhausted day)
+    dt_range = compute_dual_thrust_range(symbol)
+    if dt_range is not None and or_range > ORB_DUAL_THRUST_MAX_MULTIPLE * dt_range:
+        log.info(
+            f"{symbol}: OR range ${or_range:.2f} > {ORB_DUAL_THRUST_MAX_MULTIPLE}× "
+            f"DT expected ${dt_range:.2f} — gap day, skipping"
+        )
         return False
 
     # Improvement 3: per-symbol profit multiplier
