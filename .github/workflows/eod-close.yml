@@ -1,26 +1,33 @@
-name: EOD Force-Close (Safety Net)
+name: US Bots — EOD Safety Close
 
-# Dedicated end-of-day position closer — completely independent of the main
-# 5-minute polling workflow. Runs at 19:50 UTC (3:50 PM ET) every trading day,
-# AFTER the 3:45 PM ET in-bot EOD close fires, to guarantee all positions are
-# flat before the market closes. Also triggered manually for emergency closes.
+# Last-resort position closer for BOTH US bots (equity + options).
+# Fires at 19:55 UTC (3:55 PM ET) — after each bot's own 3:45 PM ET close,
+# but before the 4:00 PM ET market close.
 #
 # Why a separate workflow?
-#   GitHub Actions cron has no SLA — the main bot's 3:45 PM ET run can be
-#   delayed by up to 60 minutes during heavy load. This job is the last line
-#   of defence: even if every 5-min bot run fails, this closes everything.
+#   GitHub Actions cron has no delivery SLA — the main bot runs can be
+#   delayed by up to 60 minutes under heavy load. This is the backstop:
+#   even if every 5-minute run fails, this closes everything flat.
+#
+# Closes: ALL open positions (equity + options) via close_all.py.
+# This is intentional — at EOD, we want a clean slate regardless of type.
 
 on:
   schedule:
-    - cron: '50 19 * * 1-5'   # 19:50 UTC = 3:50 PM ET (Mon–Fri)
+    - cron: '55 19 * * 1-5'   # 19:55 UTC = 3:55 PM ET (Mon–Fri)
   workflow_dispatch:            # manual trigger for emergency use
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: us-bots-eod-close
+  cancel-in-progress: false
+
 jobs:
   eod-force-close:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Force-close all open positions
+      - name: Force-close all US positions (equity + options)
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}

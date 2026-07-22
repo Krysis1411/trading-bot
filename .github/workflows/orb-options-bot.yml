@@ -1,18 +1,32 @@
-name: ORB Options Bot
+name: US Options ORB Bot
+
+# Runs orb_options_bot.py every 5 minutes during US market hours (Mon-Fri).
+# Each run is a single stateless check — no loop inside the script.
+# The cron replaces the old while-loop design that caused long-run failures:
+#   - old design: while True loop running for hours → memory/connection issues
+#   - new design: fresh process every 5 min → stateless, no long-run failures
+#
+# Separation: this workflow only touches US_OPTION positions (orb_options_bot.py
+# filters by AssetClass.US_OPTION). The equity bot workflow runs independently.
 
 on:
   schedule:
-    # Every 5 minutes Mon-Fri, 13:30-20:30 UTC (9:30am-4:30pm EDT)
-    # Runs slightly past 4pm to catch the forced EOD close at 3:45pm ET
-    - cron: '*/5 13-20 * * 1-5'
-  workflow_dispatch: # Manual trigger from GitHub Actions UI
+    # Every 5 minutes Mon-Fri, 13:30-21:00 UTC (9:30 AM-5:00 PM ET)
+    # Slight overshoot past 4 PM ET catches the 3:45 PM ET forced EOD close.
+    - cron: '*/5 13-21 * * 1-5'
+  workflow_dispatch:   # manual trigger from GitHub Actions UI
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: us-options-orb-bot
+  cancel-in-progress: false   # let the running check finish; queue only the latest trigger
+
 jobs:
   run-orb-options-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 4        # hard kill at 4 min — next cron fires at 5 min
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run ORB options bot
+      - name: Run US options ORB bot
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
