@@ -115,9 +115,18 @@ IC_PROFIT_TARGET_PCT = 0.50 # Close IC when unrealised P&L reaches 50% of credit
 IC_PNL_STOP_MULTIPLE = 2.0  # P&L stop: close if total loss > 2× credit received
 IC_MAX_PCR_ATM = 2.5        # Skip IC if put/call OI ratio near ATM > this (directional bias too strong for neutral condor)
 
-# ---------------------------------------------------------------------------
-# Entry quality filters (derived from backtest analysis)
-# ---------------------------------------------------------------------------
+# Skip ANY new options entry (IC, straddle, directional) when the underlying's
+# trailing 10-daily-bar range exceeds this fraction of price. Live paper-trading
+# data confirms this twice, independently: the single worst loss in each of two
+# separate review periods came from a name in the middle of an un-based, extreme
+# momentum surge -- QBTS/RGTI (~50% 10-day range, -$1,617 combined) and MRNA
+# (70.5% range, +10.37 ATR move, zero valid consolidation zones, -$386, the
+# single worst trade of that period). A name moving this violently has no real
+# "fair value" for either premium-selling (strikes get blown through) or
+# premium-buying (IV is already pricing in the chaos) -- see
+# strategies/zone_detector.py's find_zones(), reused here (India zone-strategy
+# project) as the same base+breakout quality check, not a new indicator.
+MAX_10D_RANGE_PCT = 0.30
 
 # Symbols that consistently lose money in backtest regardless of strategy.
 # Large-caps / ETFs with low IV rank get routed to debit spreads/straddles

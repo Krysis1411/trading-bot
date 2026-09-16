@@ -50,8 +50,10 @@ from config import (
     IC_MAX_ENTRY_HOUR,
     IC_MAX_ENTRY_MINUTE,
     MIN_BREAKOUT_STRENGTH_PCT,
+    MAX_10D_RANGE_PCT,
 )
 from screener import get_active_symbols
+from strategies.zone_detector import find_zones
 
 load_dotenv()
 
@@ -158,6 +160,31 @@ def get_daily_bars(symbol: str, lookback_days: int = 60) -> pd.DataFrame | None:
     except Exception as e:
         log.warning(f"{symbol}: failed to fetch daily bars — {e}")
         return None
+
+
+def is_in_extreme_range_expansion(symbol: str) -> tuple[bool, str]:
+    """
+    True if `symbol` is in the middle of an un-based, extreme momentum surge --
+    the single worst options loss in each of two independent live paper-trading
+    review periods (QBTS/RGTI, then MRNA) came from exactly this condition. A
+    longer lookback than get_daily_bars()'s regime-detection default is used
+    here specifically so find_zones() has enough history to find a real base,
+    not just enough for the 10-day range check itself.
+    """
+    bars = get_daily_bars(symbol, lookback_days=400)
+    if bars is None or len(bars) < 30:
+        return False, "insufficient history -- filter not applied"
+
+    recent = bars.iloc[-10:]
+    range_pct = (recent["high"].max() - recent["low"].min()) / recent["close"].iloc[-1]
+    if range_pct <= MAX_10D_RANGE_PCT:
+        return False, f"10d range {range_pct:.0%} within normal bounds"
+
+    zones = find_zones(bars, timeframe="1d")
+    if zones:
+        return False, f"10d range {range_pct:.0%} elevated but {len(zones)} valid consolidation zone(s) found -- not pure momentum"
+
+    return True, f"10d range {range_pct:.0%} > {MAX_10D_RANGE_PCT:.0%} with zero valid consolidation zones in the last year"
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +496,13 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
     # Minimum underlying price — cheap stocks have illiquid options and wide spreads
     if current_price < MIN_UNDERLYING_PRICE:
         log.info(f"{symbol} | Price ${current_price:.2f} < ${MIN_UNDERLYING_PRICE:.0f} minimum — skipping (illiquid options)")
+        return False
+
+    # Extreme, un-based range expansion — see is_in_extreme_range_expansion's
+    # docstring; validated against two independent live-trading loss events.
+    extreme, reason = is_in_extreme_range_expansion(symbol)
+    if extreme:
+        log.info(f"{symbol} | {reason} — skipping (no fair value for either side of an options trade here)")
         return False
 
     # Entry time cutoff — backtest win rate after 12:30 PM drops to 7.5% (3/40 trades)
