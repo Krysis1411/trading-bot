@@ -828,45 +828,47 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
             f"Risk: ${risk:.2f} | Qty: {qty}"
         )
 
-    # ── Bull Call Spread / Bear Put Spread (all 3 signals confirmed) ──────────
+    # ── Long Call / Long Put, single-leg (all 3 signals confirmed) ────────────
+    # Forward-looking test, not a proven fix: a full fill-log reconstruction
+    # of every options trade this account has ever made (22 combos, 22.7%
+    # win rate, -$2,905 total) found no structure with a demonstrated edge --
+    # multi-leg debit spreads included. A single long option has ONE premium
+    # at risk instead of two (spread's short leg only ever reduces cost, it
+    # doesn't add a second way to win), and DIRECTIONAL_FULL is specifically
+    # the highest-confidence situation (all 3 signals agree) -- the case
+    # where paying to hedge against being wrong on direction makes the least
+    # sense. STRADDLE_PLAY and PREMIUM_SELL are untouched: they represent
+    # genuinely different market views (mixed-confidence / range-bound) that
+    # a directional single-leg bet doesn't fit as a replacement for. Every
+    # order now carries a client_order_id tagging situation/structure/
+    # confirmation/IV/DTE specifically so the NEXT read of this doesn't
+    # require reconstructing everything from raw fills again.
     elif situation == MarketSituation.DIRECTIONAL_FULL:
         if is_breakout_above:
-            strategy = "Bull Call Spread"
+            strategy = "Long Call"
             long_call = atm_call
-            oc_candidates = calls[calls['strike'] > long_call['strike']]
-            if oc_candidates.empty:
-                log.warning(f"{symbol} | Bull Call Spread rejected: no short call candidates")
-                return False
-            short_call = oc_candidates.iloc[(oc_candidates['strike'] - (long_call['strike'] + or_range)).abs().argsort()].iloc[0]
-            net_debit = max(0.05, float(long_call['ask']) - float(short_call['bid']))
+            net_debit = max(0.05, float(long_call['ask']))
             qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
             legs = [
-                OptionLegRequest(symbol=long_call['contractSymbol'],  side=OrderSide.BUY,  ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                OptionLegRequest(symbol=short_call['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+                OptionLegRequest(symbol=long_call['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
             ]
             limit_price = round(net_debit, 2)
             log.info(
-                f"{symbol} | Bull Call Spread ↑ | Confirmation: {confirmation_score}/3 "
+                f"{symbol} | Long Call ↑ | Confirmation: {confirmation_score}/3 "
                 f"(SPY={'✓' if spy_bullish else '✗'} Daily={stock_daily_trend} Skew={iv_skew:+.3f}) "
                 f"| Debit: ${net_debit:.2f} | Qty: {qty}"
             )
         else:
-            strategy = "Bear Put Spread"
+            strategy = "Long Put"
             long_put = atm_put
-            op_candidates = puts[puts['strike'] < long_put['strike']]
-            if op_candidates.empty:
-                log.warning(f"{symbol} | Bear Put Spread rejected: no short put candidates")
-                return False
-            short_put = op_candidates.iloc[(op_candidates['strike'] - (long_put['strike'] - or_range)).abs().argsort()].iloc[0]
-            net_debit = max(0.05, float(long_put['ask']) - float(short_put['bid']))
+            net_debit = max(0.05, float(long_put['ask']))
             qty = max(1, int(ORB_OPTIONS_POSITION_SIZE / (net_debit * 100)))
             legs = [
-                OptionLegRequest(symbol=long_put['contractSymbol'],  side=OrderSide.BUY,  ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
-                OptionLegRequest(symbol=short_put['contractSymbol'], side=OrderSide.SELL, ratio_qty=1, position_intent=PositionIntent.SELL_TO_OPEN),
+                OptionLegRequest(symbol=long_put['contractSymbol'], side=OrderSide.BUY, ratio_qty=1, position_intent=PositionIntent.BUY_TO_OPEN),
             ]
             limit_price = round(net_debit, 2)
             log.info(
-                f"{symbol} | Bear Put Spread ↓ | Confirmation: {confirmation_score}/3 "
+                f"{symbol} | Long Put ↓ | Confirmation: {confirmation_score}/3 "
                 f"(SPY={'✓' if spy_bullish is False else '✗'} Daily={stock_daily_trend} Skew={iv_skew:+.3f}) "
                 f"| Debit: ${net_debit:.2f} | Qty: {qty}"
             )
@@ -890,29 +892,52 @@ def process_symbol_options(symbol: str, spy_bullish: bool | None,
         log.info(f"{symbol} | No strategy built for situation={situation.value} — check chain availability")
         return False
 
-    # Place MLEG order
+    # client_order_id tags every order with WHY it was taken -- situation,
+    # structure, confirmation score, IV rank, DTE. Alpaca keeps this
+    # permanently on the order/fill record, queryable via the API forever,
+    # specifically so a future performance review doesn't need to
+    # reconstruct trade context from raw fills (which is how the single-leg
+    # vs spread comparison above got made in the first place).
+    now_et = get_now_et()
+    tag = f"{situation.value[:10]}_{strategy.lower().replace(' ', '')[:14]}_cs{confirmation_score}_ivr{int(iv_rank)}_dte{dte_days}_{now_et.strftime('%m%d%H%M')}"
+    client_order_id = f"{symbol}_{tag}"[:128]
+
+    # Place order. MLEG requires 2+ legs -- a single-leg long call/put (the
+    # DIRECTIONAL_FULL case above) uses a plain single-symbol limit order
+    # instead, same shape as any regular options buy.
     # limit_price: positive = net debit (we pay), negative = net credit (we receive)
     if DRY_RUN:
         log.info(
             f"[DRY RUN] Would submit {strategy} for {symbol}"
             f" | Legs: {[l.symbol for l in legs]}"
-            f" | Qty: {qty} | Limit: ${limit_price:.2f}"
+            f" | Qty: {qty} | Limit: ${limit_price:.2f} | Tag: {client_order_id}"
         )
         return True
 
     try:
-        req = LimitOrderRequest(
-            qty=qty,
-            limit_price=limit_price,
-            order_class=OrderClass.MLEG,
-            time_in_force=TimeInForce.DAY,
-            legs=legs,
-        )
+        if len(legs) == 1:
+            req = LimitOrderRequest(
+                symbol=legs[0].symbol,
+                qty=qty,
+                side=legs[0].side,
+                limit_price=limit_price,
+                time_in_force=TimeInForce.DAY,
+                client_order_id=client_order_id,
+            )
+        else:
+            req = LimitOrderRequest(
+                qty=qty,
+                limit_price=limit_price,
+                order_class=OrderClass.MLEG,
+                time_in_force=TimeInForce.DAY,
+                legs=legs,
+                client_order_id=client_order_id,
+            )
         order = trading_client.submit_order(req)
-        log.info(f"SUBMITTED {strategy} for {symbol} | ID: {order.id} | Qty: {qty} | Limit: ${limit_price:.2f}")
+        log.info(f"SUBMITTED {strategy} for {symbol} | ID: {order.id} | Qty: {qty} | Limit: ${limit_price:.2f} | Tag: {client_order_id}")
         return True
     except Exception as e:
-        log.error(f"{symbol} | Failed to submit MLEG order: {e}")
+        log.error(f"{symbol} | Failed to submit order: {e}")
         return False
 
 
